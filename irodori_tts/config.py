@@ -149,7 +149,15 @@ class TrainConfig:
     max_steps: int = 200000
     log_every: int = 100
     save_every: int = 1000
+    save_every_epochs: int = 0
+    checkpoint_latest_n: int = 0
     checkpoint_best_n: int = 0
+    sample_every_epochs: int = 0
+    sample_cuda_visible_devices: str = "0"
+    sample_num_steps: int = 24
+    sample_seconds: float = 5.0
+    sample_seed: int = 20260715
+    sample_reference_count: int = 3
     valid_ratio: float = 0.0
     valid_every: int = 0
     progress: bool = True

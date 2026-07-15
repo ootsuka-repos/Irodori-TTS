@@ -1,3 +1,4 @@
+# Aratako/Irodori-TTS-500M-v3 full fine-tuning on a 16 GB GPU.
 model:
   latent_dim: 32
   latent_patch_size: 1
@@ -18,69 +19,57 @@ model:
   speaker_patch_size: 1
   timestep_embed_dim: 512
   adaln_rank: 192
-  use_caption_condition: true
-  use_speaker_condition: true
-  caption_vocab_size: 99574
-  caption_tokenizer_repo: llm-jp/llm-jp-3-150m
-  caption_add_bos: true
-  caption_dim: 512
-  caption_layers: 10
-  caption_heads: 8
-  caption_mlp_ratio: 2.6
   use_duration_predictor: true
   duration_aux_dim: 14
   duration_hidden_dim: 1024
   duration_layers: 3
   duration_dropout: 0.1
   duration_attention_heads: 8
-  duration_architecture: token_sum_dual_adarn_zero_no_aux
+  duration_architecture: token_sum_adarn_zero_no_aux
   duration_token_init_frames: 9.0
   duration_speaker_fusion: adarn_zero
-  duration_caption_fusion: adarn_zero
-  duration_caption_pooling: masked_mean
 
 train:
-  train_mode: duration_only
-  batch_size: 80
-  gradient_accumulation_steps: 1
-  num_workers: 16
+  train_mode: rf
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  gradient_checkpointing: true
+  num_workers: 2
   dataloader_persistent_workers: true
   dataloader_prefetch_factor: 4
   allow_tf32: true
   compile_model: false
   precision: bf16
-  optimizer: muon
-  muon_momentum: 0.95
-  learning_rate: 0.0001
+  optimizer: adamw8bit
+  learning_rate: 0.0003
   weight_decay: 0.01
   lr_scheduler: wsd
   warmup_steps: 1000
-  stable_steps: 24000
+  stable_steps: 900000
   min_lr_scale: 0.01
-  max_steps: 30000
+  max_steps: 1000000
   max_text_len: 256
-  max_caption_len: 512
   text_condition_dropout: 0.1
   speaker_condition_dropout: 0.1
-  caption_condition_dropout: 0.1
   timestep_stratified: true
   max_latent_steps: 750
-  fixed_target_latent_steps:
-  fixed_target_full_mask: false
   rf_loss_mode: utterance_mean
-  duration_loss_weight: 1.0
+  duration_loss_weight: 0.1
   duration_speaker_dropout: 0.1
-  duration_caption_dropout: 0.1
   duration_huber_delta: 0.1
-  log_every: 100
-  save_every: 1000
-  checkpoint_best_n: 5
+  log_every: 10
+  save_every: 0
+  save_every_epochs: 1
+  checkpoint_latest_n: 3
+  checkpoint_best_n: 0
+  sample_every_epochs: 1
+  sample_cuda_visible_devices: "0"
+  sample_num_steps: 24
+  sample_seconds: 5.0
+  sample_seed: 20260715
+  sample_reference_count: 3
+  valid_ratio: 0.0
+  valid_every: 0
+  lora_enabled: false
   wandb_enabled: false
-  wandb_project:
-  wandb_entity:
-  wandb_run_name:
-  wandb_mode: online
-  ddp_find_unused_parameters: false
-  valid_ratio: 0.0005
-  valid_every: 1000
   seed: 0

@@ -174,14 +174,23 @@ def _partition_muon_params(
 
 def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
     opt_name = cfg.optimizer.lower()
-    if opt_name == "adamw":
+    if opt_name in {"adamw", "adamw8bit"}:
         decay, no_decay = _partition_adamw_params(model)
         param_groups = []
         if decay:
             param_groups.append({"params": decay, "weight_decay": cfg.weight_decay})
         if no_decay:
             param_groups.append({"params": no_decay, "weight_decay": 0.0})
-        return torch.optim.AdamW(
+        optimizer_cls = torch.optim.AdamW
+        if opt_name == "adamw8bit":
+            try:
+                from bitsandbytes.optim import AdamW8bit
+            except ImportError as exc:
+                raise RuntimeError(
+                    "optimizer=adamw8bit requires bitsandbytes. Install the project dependencies."
+                ) from exc
+            optimizer_cls = AdamW8bit
+        return optimizer_cls(
             param_groups if param_groups else model.parameters(),
             lr=cfg.learning_rate,
             weight_decay=0.0,

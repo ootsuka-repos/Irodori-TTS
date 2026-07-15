@@ -8,7 +8,7 @@ import math
 import os
 import re
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
@@ -22,6 +22,31 @@ from tqdm import tqdm
 
 from irodori_tts.codec import DACVAECodec
 from irodori_tts.text_normalization import normalize_text
+
+_MISSING = object()
+
+
+def _get_column_value(
+    sample: Mapping[str, Any],
+    column: str,
+    default: Any = None,
+) -> Any:
+    """Read a top-level or dotted nested column from a dataset sample."""
+    if column in sample:
+        return sample[column]
+
+    current: Any = sample
+    for component in column.split("."):
+        if not isinstance(current, Mapping) or component not in current:
+            return default
+        current = current[component]
+    return current
+
+
+def _has_column(features: Any, column: str) -> bool:
+    if not isinstance(features, Mapping):
+        return False
+    return _get_column_value(features, column, _MISSING) is not _MISSING
 
 
 def _coerce_text(value: Any) -> str:
@@ -189,13 +214,13 @@ def _prepare_example(
     args: argparse.Namespace,
 ) -> _PreparedItem:
     try:
-        text = _coerce_text(sample.get(args.text_column, ""))
+        text = _coerce_text(_get_column_value(sample, args.text_column, ""))
         if args.text_normalize:
             text = normalize_text(text)
         text = text.strip()
         caption = None
         if args.caption_column is not None:
-            caption = _coerce_text(sample.get(args.caption_column, ""))
+            caption = _coerce_text(_get_column_value(sample, args.caption_column, ""))
             caption = caption.strip() or None
 
         if not text:
@@ -205,7 +230,7 @@ def _prepare_example(
         if args.speaker_columns:
             speaker_components: list[str] = []
             for speaker_column in args.speaker_columns:
-                speaker_raw = sample.get(speaker_column, None)
+                speaker_raw = _get_column_value(sample, speaker_column, None)
                 speaker_component = _sanitize_id_component(speaker_raw, fallback="")
                 if speaker_component:
                     speaker_components.append(speaker_component)
@@ -497,6 +522,7 @@ def _run_worker(
     ds = load_dataset(
         path=args.dataset,
         name=args.config,
+        revision=args.revision,
         split=args.split,
         data_files=_parse_data_files(args.data_files),
         cache_dir=args.cache_dir,
@@ -506,12 +532,20 @@ def _run_worker(
 
     if args.audio_column not in ds.column_names:
         raise ValueError(f"audio column '{args.audio_column}' not found: {ds.column_names}")
-    if args.text_column not in ds.column_names:
+    if args.text_column not in ds.column_names and not _has_column(ds.features, args.text_column):
         raise ValueError(f"text column '{args.text_column}' not found: {ds.column_names}")
-    if args.caption_column is not None and args.caption_column not in ds.column_names:
+    if (
+        args.caption_column is not None
+        and args.caption_column not in ds.column_names
+        and not _has_column(ds.features, args.caption_column)
+    ):
         raise ValueError(f"caption column '{args.caption_column}' not found: {ds.column_names}")
     if args.speaker_columns:
-        missing_speaker_columns = [c for c in args.speaker_columns if c not in ds.column_names]
+        missing_speaker_columns = [
+            column
+            for column in args.speaker_columns
+            if column not in ds.column_names and not _has_column(ds.features, column)
+        ]
         if missing_speaker_columns:
             raise ValueError(
                 f"speaker column(s) not found: {missing_speaker_columns}; available={ds.column_names}"
@@ -751,6 +785,11 @@ def main() -> None:
     )
     parser.add_argument("--dataset", required=True, help="HF dataset name, e.g. myorg/my_dataset")
     parser.add_argument("--config", default=None, help="HF dataset config/subset")
+    parser.add_argument(
+        "--revision",
+        default=None,
+        help="Optional dataset revision (branch, tag, or commit SHA)",
+    )
     parser.add_argument("--split", default="train", help="Dataset split (default: train)")
     parser.add_argument(
         "--data-files",
@@ -763,7 +802,11 @@ def main() -> None:
         ),
     )
     parser.add_argument("--audio-column", required=True, help="Audio column name")
-    parser.add_argument("--text-column", required=True, help="Text column name")
+    parser.add_argument(
+        "--text-column",
+        required=True,
+        help="Text column name; dotted nested paths are supported",
+    )
     parser.add_argument(
         "--text-normalize",
         action=argparse.BooleanOptionalAction,
@@ -776,14 +819,18 @@ def main() -> None:
     parser.add_argument(
         "--caption-column",
         default=None,
-        help="Optional caption/style-control text column name. Output manifest key is always 'caption'.",
+        help=(
+            "Optional caption/style-control text column name. Dotted nested paths are "
+            "supported; output manifest key is always 'caption'."
+        ),
     )
     parser.add_argument(
         "--speaker-column",
         action="append",
         default=None,
         help=(
-            "Optional speaker/source column name. Can be specified multiple times "
+            "Optional speaker/source column name (dotted nested paths supported). "
+            "Can be specified multiple times "
             "or as a comma-separated list (e.g. --speaker-column speaker,source). "
             "If set, output manifest will include speaker_id built from dataset namespace + column value(s)."
         ),

@@ -219,3 +219,7 @@ gradio_outputs/
 gradio_outputs_voicedesign/
 outputs/
 data/
+
+# Local source/training audio. Keep only its workflow documentation in Git.
+grok_data/**
+!grok_data/README.md

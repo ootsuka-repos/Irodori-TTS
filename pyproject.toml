@@ -1,11 +1,15 @@
+[build-system]
+requires = ["setuptools>=77.0.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "irodori-tts"
 version = "0.1.0"
 description = "Irodori-TTS training and inference codebase"
-readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
+    "bitsandbytes>=0.49.2",
     "dacvae",
     "datasets>=3.0.0",
     "gradio>=5.0.0",
@@ -14,7 +18,9 @@ dependencies = [
     "numba>=0.57.0",
     "peft>=0.18.0",
     "pyyaml>=6.0",
+    "requests>=2.32.0",
     "safetensors>=0.7.0",
+    "scikit-learn>=1.7.0",
     "soundfile>=0.12.0",
     "sentencepiece>=0.1.99,<0.2",
     "silentcipher @ git+https://github.com/SesameAILabs/silentcipher.git@d46d7d0893a583d8968ab3a6626e2289faec9152",
@@ -30,6 +36,11 @@ dependencies = [
 irodori-train = "irodori_tts.cli.train:main"
 irodori-infer = "irodori_tts.cli.infer:main"
 irodori-prepare-manifest = "irodori_tts.cli.prepare_manifest:main"
+irodori-prepare-grok-stt = "irodori_tts.cli.prepare_grok_stt:main"
+irodori-cluster-nonverbal = "irodori_tts.cli.cluster_nonverbal:main"
+irodori-prepare-nonverbal-events = "irodori_tts.cli.prepare_nonverbal_events:main"
+irodori-prepare-nonverbal-training = "irodori_tts.cli.prepare_nonverbal_training:main"
+irodori-merge-latent-manifests = "irodori_tts.cli.merge_latent_manifests:main"
 irodori-convert-checkpoint = "irodori_tts.cli.convert_checkpoint:main"
 irodori-web = "irodori_tts.apps.gradio:main"
 irodori-voice-design-web = "irodori_tts.apps.voice_design:main"
@@ -61,6 +72,10 @@ xpu = [
 dev = [
     "pytest>=8.3.0",
     "ruff>=0.9.0",
+]
+nonverbal-analysis = [
+    "anime-speaker-embedding==0.2.1",
+    "pyannote.audio==3.1.1",
 ]
 
 [tool.uv]

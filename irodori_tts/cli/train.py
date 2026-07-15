@@ -7,6 +7,7 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import sys
 from contextlib import nullcontext
 from dataclasses import asdict, replace
@@ -278,6 +279,52 @@ def _final_checkpoint_path(output_dir: Path, train_cfg: TrainConfig) -> Path:
     if train_config_uses_lora(train_cfg):
         return output_dir / "checkpoint_final"
     return output_dir / "checkpoint_final.pt"
+
+
+def run_epoch_test_inference(
+    *,
+    checkpoint_path: Path,
+    manifest_path: str | Path,
+    output_dir: Path,
+    epoch: int,
+    step: int,
+    train_cfg: TrainConfig,
+) -> tuple[bool, Path]:
+    sample_dir = output_dir / "samples" / f"epoch_{epoch:06d}_step_{step:07d}"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sample_dir / "inference.log"
+    command = [
+        sys.executable,
+        "-m",
+        "irodori_tts.cli.sample_training_checkpoint",
+        "--checkpoint",
+        str(checkpoint_path.resolve()),
+        "--manifest",
+        str(Path(manifest_path).resolve()),
+        "--output-dir",
+        str(sample_dir.resolve()),
+        "--num-steps",
+        str(train_cfg.sample_num_steps),
+        "--seconds",
+        str(train_cfg.sample_seconds),
+        "--seed",
+        str(train_cfg.sample_seed),
+        "--reference-count",
+        str(train_cfg.sample_reference_count),
+    ]
+    child_env = os.environ.copy()
+    child_env["CUDA_VISIBLE_DEVICES"] = str(train_cfg.sample_cuda_visible_devices)
+    child_env["PYTHONUNBUFFERED"] = "1"
+    with log_path.open("w", encoding="utf-8") as log_file:
+        completed = subprocess.run(
+            command,
+            cwd=Path.cwd(),
+            env=child_env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    return completed.returncode == 0, sample_dir
 
 
 def build_condition_tokenizer(
@@ -1415,7 +1462,12 @@ def main() -> None:
     )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--optimizer", choices=["adamw", "muon"], default="muon")
+    parser.add_argument(
+        "--optimizer",
+        choices=["adamw", "adamw8bit", "muon"],
+        default="muon",
+        help="Optimizer implementation; adamw8bit uses bitsandbytes to reduce state memory.",
+    )
     parser.add_argument("--adam-beta1", type=float, default=0.9)
     parser.add_argument("--adam-beta2", type=float, default=0.999)
     parser.add_argument("--adam-eps", type=float, default=1e-8)
@@ -1522,6 +1574,8 @@ def main() -> None:
     )
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--save-every", type=int, default=1000)
+    parser.add_argument("--save-every-epochs", type=int, default=None)
+    parser.add_argument("--checkpoint-latest-n", type=int, default=None)
     parser.add_argument(
         "--checkpoint-best-n",
         type=int,
@@ -1780,6 +1834,10 @@ def main() -> None:
         train_cfg = replace(train_cfg, log_every=args.log_every)
     if cli_provided(raw_argv, "--save-every"):
         train_cfg = replace(train_cfg, save_every=args.save_every)
+    if args.save_every_epochs is not None:
+        train_cfg = replace(train_cfg, save_every_epochs=args.save_every_epochs)
+    if args.checkpoint_latest_n is not None:
+        train_cfg = replace(train_cfg, checkpoint_latest_n=args.checkpoint_latest_n)
     if cli_provided(raw_argv, "--checkpoint-best-n"):
         train_cfg = replace(train_cfg, checkpoint_best_n=args.checkpoint_best_n)
     if cli_provided(raw_argv, "--valid-ratio"):
@@ -2051,6 +2109,28 @@ def main() -> None:
         raise ValueError(f"valid_ratio must be in [0, 1), got {train_cfg.valid_ratio}")
     if train_cfg.valid_every < 0:
         raise ValueError(f"valid_every must be >= 0, got {train_cfg.valid_every}")
+    if train_cfg.save_every < 0:
+        raise ValueError(f"save_every must be >= 0, got {train_cfg.save_every}")
+    if train_cfg.save_every_epochs < 0:
+        raise ValueError(
+            f"save_every_epochs must be >= 0, got {train_cfg.save_every_epochs}"
+        )
+    if train_cfg.checkpoint_latest_n < 0:
+        raise ValueError(
+            f"checkpoint_latest_n must be >= 0, got {train_cfg.checkpoint_latest_n}"
+        )
+    if train_cfg.sample_every_epochs < 0:
+        raise ValueError(
+            f"sample_every_epochs must be >= 0, got {train_cfg.sample_every_epochs}"
+        )
+    if train_cfg.sample_num_steps <= 0:
+        raise ValueError(f"sample_num_steps must be > 0, got {train_cfg.sample_num_steps}")
+    if train_cfg.sample_seconds <= 0:
+        raise ValueError(f"sample_seconds must be > 0, got {train_cfg.sample_seconds}")
+    if train_cfg.sample_reference_count <= 0:
+        raise ValueError(
+            f"sample_reference_count must be > 0, got {train_cfg.sample_reference_count}"
+        )
     if train_cfg.valid_ratio > 0.0 and train_cfg.valid_every <= 0:
         raise ValueError("valid_every must be > 0 when valid_ratio > 0.")
     if train_cfg.valid_ratio == 0.0 and train_cfg.valid_every > 0 and is_main_process:
@@ -2312,9 +2392,12 @@ def main() -> None:
 
     has_validation = valid_loader is not None and train_cfg.valid_every > 0
     checkpoint_retention_enabled = train_cfg.checkpoint_best_n > 0
-    periodic_checkpoint_keep = 0
+    periodic_checkpoint_keep = int(train_cfg.checkpoint_latest_n)
     if checkpoint_retention_enabled:
-        periodic_checkpoint_keep = 1 if has_validation else int(train_cfg.checkpoint_best_n) + 1
+        if periodic_checkpoint_keep <= 0:
+            periodic_checkpoint_keep = (
+                1 if has_validation else int(train_cfg.checkpoint_best_n) + 1
+            )
     best_val_checkpoints: list[tuple[float, int, Path]] = []
     if is_main_process:
         if checkpoint_retention_enabled and has_validation:
@@ -2324,7 +2407,11 @@ def main() -> None:
                 train_cfg.checkpoint_best_n,
             )
         if checkpoint_retention_enabled and has_validation:
-            print(f"Checkpoint retention: latest=1 + best_val_loss={train_cfg.checkpoint_best_n}.")
+            print(
+                "Checkpoint retention: "
+                f"latest={periodic_checkpoint_keep} + "
+                f"best_val_loss={train_cfg.checkpoint_best_n}."
+            )
         elif checkpoint_retention_enabled:
             print(
                 f"Checkpoint retention: validation disabled, keep latest {periodic_checkpoint_keep} periodic checkpoints."
@@ -2933,7 +3020,11 @@ def main() -> None:
                                     )
                             wandb_run.log(metrics, step=step)
 
-                if step % train_cfg.save_every == 0 and is_main_process:
+                if (
+                    train_cfg.save_every > 0
+                    and step % train_cfg.save_every == 0
+                    and is_main_process
+                ):
                     save_checkpoint(
                         _periodic_checkpoint_path(output_dir, step, train_cfg),
                         raw_model,
@@ -3036,6 +3127,50 @@ def main() -> None:
             # A broken iteration may still own one prefetched GPU batch.
             # Closing the generator releases it before final validation/save.
             device_batches.close()
+            if (
+                train_cfg.save_every_epochs > 0
+                and epoch % train_cfg.save_every_epochs == 0
+                and step < train_cfg.max_steps
+                and is_main_process
+            ):
+                epoch_checkpoint_path = _periodic_checkpoint_path(output_dir, step, train_cfg)
+                save_checkpoint(
+                    epoch_checkpoint_path,
+                    raw_model,
+                    optimizer,
+                    scheduler,
+                    step,
+                    model_cfg,
+                    train_cfg,
+                    base_init=base_init,
+                )
+                enforce_periodic_checkpoint_limit(
+                    output_dir=output_dir,
+                    keep_count=periodic_checkpoint_keep,
+                )
+                if (
+                    train_cfg.sample_every_epochs > 0
+                    and epoch % train_cfg.sample_every_epochs == 0
+                ):
+                    progress.write(
+                        f"generating comparison samples for epoch={epoch} step={step}..."
+                    )
+                    sample_ok, sample_dir = run_epoch_test_inference(
+                        checkpoint_path=epoch_checkpoint_path,
+                        manifest_path=train_cfg.manifest_path,
+                        output_dir=output_dir,
+                        epoch=epoch,
+                        step=step,
+                        train_cfg=train_cfg,
+                    )
+                    if sample_ok:
+                        progress.write(f"saved comparison samples: {sample_dir}")
+                    else:
+                        progress.write(
+                            f"warning: comparison sample generation failed; see {sample_dir / 'inference.log'}"
+                        )
+            if distributed and train_cfg.sample_every_epochs > 0:
+                dist.barrier()
 
         if (
             valid_loader is not None
