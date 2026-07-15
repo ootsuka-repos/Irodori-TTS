@@ -31,9 +31,10 @@ model:
 
 train:
   train_mode: rf
-  batch_size: 1
-  gradient_accumulation_steps: 4
+  batch_size: 8
+  gradient_accumulation_steps: 1
   gradient_checkpointing: true
+  data_parallel: false
   num_workers: 2
   dataloader_persistent_workers: true
   dataloader_prefetch_factor: 4
@@ -57,7 +58,11 @@ train:
   duration_loss_weight: 0.1
   duration_speaker_dropout: 0.1
   duration_huber_delta: 0.1
-  log_every: 10
+  log_every: 1
+  tensorboard_enabled: true
+  tensorboard_log_dir: tensorboard
+  tensorboard_launch: true
+  tensorboard_port: 6006
   save_every: 0
   save_every_epochs: 1
   checkpoint_latest_n: 3

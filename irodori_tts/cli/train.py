@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import webbrowser
 from contextlib import nullcontext
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -1092,7 +1093,14 @@ def setup_distributed(device_arg: str) -> tuple[int, int, int, bool, torch.devic
         if not torch.cuda.is_available():
             raise RuntimeError("WORLD_SIZE>1 detected, but CUDA is not available.")
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
+        backend = "nccl" if dist.is_nccl_available() else "gloo"
+        init_method = os.environ.get("IRODORI_DIST_INIT_METHOD", "env://")
+        dist.init_process_group(
+            backend=backend,
+            init_method=init_method,
+            rank=rank,
+            world_size=world_size,
+        )
         device = torch.device(f"cuda:{local_rank}")
     else:
         device = torch.device(device_arg)
@@ -2197,6 +2205,39 @@ def main() -> None:
         print(
             f"W&B enabled: project={train_cfg.wandb_project} mode={train_cfg.wandb_mode} run={wandb_run.name if wandb_run is not None else train_cfg.wandb_run_name}"
         )
+    tensorboard_writer = None
+    tensorboard_process = None
+    if train_cfg.tensorboard_enabled and is_main_process:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError as exc:
+            raise RuntimeError(
+                "TensorBoard logging is enabled, but `tensorboard` is not installed. "
+                "Run `uv sync --extra cu128` to install it."
+            ) from exc
+        tensorboard_dir = output_dir / train_cfg.tensorboard_log_dir
+        tensorboard_writer = SummaryWriter(log_dir=str(tensorboard_dir), purge_step=None)
+        print(f"TensorBoard logging enabled: {tensorboard_dir}")
+        if train_cfg.tensorboard_launch:
+            tensorboard_url = f"http://localhost:{train_cfg.tensorboard_port}"
+            tensorboard_command = [
+                sys.executable,
+                "-m",
+                "tensorboard.main",
+                "--logdir",
+                str(tensorboard_dir),
+                "--port",
+                str(train_cfg.tensorboard_port),
+            ]
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            tensorboard_process = subprocess.Popen(
+                tensorboard_command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            webbrowser.open(tensorboard_url)
+            print(f"TensorBoard opened: {tensorboard_url}")
 
     if distributed:
         local_files_only = not is_main_process
@@ -2590,6 +2631,18 @@ def main() -> None:
             find_unused_parameters=ddp_find_unused_parameters,
             broadcast_buffers=False,
         )
+    elif train_cfg.data_parallel:
+        if device.type != "cuda" or torch.cuda.device_count() < 2:
+            raise RuntimeError(
+                "data_parallel=True requires at least two visible CUDA devices."
+            )
+        model = torch.nn.DataParallel(
+            train_model,
+            device_ids=list(range(torch.cuda.device_count())),
+            output_device=0,
+        )
+        if is_main_process:
+            print(f"DataParallel enabled across {torch.cuda.device_count()} CUDA devices.")
     else:
         model = train_model
     optimizer = build_optimizer(raw_model, train_cfg)
@@ -3019,6 +3072,20 @@ def main() -> None:
                                         )
                                     )
                             wandb_run.log(metrics, step=step)
+                        if tensorboard_writer is not None:
+                            tensorboard_writer.add_scalar("train/loss", loss_value, step)
+                            tensorboard_writer.add_scalar("train/rf_loss", rf_loss_value, step)
+                            tensorboard_writer.add_scalar("train/learning_rate", lr_value, step)
+                            tensorboard_writer.add_scalar("train/epoch", epoch, step)
+                            if raw_model.cfg.use_duration_predictor:
+                                tensorboard_writer.add_scalar(
+                                    "train/duration_loss", duration_loss_value, step
+                                )
+                                tensorboard_writer.add_scalar(
+                                    "train/duration_mae_frames",
+                                    duration_mae_frames_value,
+                                    step,
+                                )
 
                 if (
                     train_cfg.save_every > 0
@@ -3271,6 +3338,11 @@ def main() -> None:
             progress.close()
         if wandb_run is not None:
             wandb_run.finish()
+        if tensorboard_writer is not None:
+            tensorboard_writer.flush()
+            tensorboard_writer.close()
+        if tensorboard_process is not None and tensorboard_process.poll() is None:
+            tensorboard_process.terminate()
         if distributed and dist.is_initialized():
             dist.destroy_process_group()
 

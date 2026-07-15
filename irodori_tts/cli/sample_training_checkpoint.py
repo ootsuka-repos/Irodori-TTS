@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 from irodori_tts.inference.runtime import (
@@ -25,7 +26,7 @@ def _fixed_references(
     manifest_path: Path, count: int
 ) -> list[tuple[Path, int, str]]:
     references: list[tuple[Path, int, str]] = []
-    seen_speakers: set[str] = set()
+    seen_works: set[str] = set()
     with manifest_path.open("r", encoding="utf-8") as handle:
         for index, line in enumerate(handle):
             if not line.strip():
@@ -34,7 +35,13 @@ def _fixed_references(
             if "latents/nonverbal/" in str(row["latent_path"]).replace("\\", "/"):
                 continue
             speaker_id = str(row.get("speaker_id", ""))
-            if not speaker_id or speaker_id in seen_speakers:
+            work_match = re.search(r"RJ\d+", speaker_id, flags=re.IGNORECASE)
+            if work_match is None:
+                work_match = re.search(
+                    r"RJ\d+", str(row["latent_path"]), flags=re.IGNORECASE
+                )
+            work_id = work_match.group(0).upper() if work_match is not None else speaker_id
+            if not speaker_id or not work_id or work_id in seen_works:
                 continue
             latent_raw = str(row["latent_path"])
             latent_path = Path(latent_raw).expanduser()
@@ -42,7 +49,7 @@ def _fixed_references(
                 latent_path = (manifest_path.parent / latent_path).resolve()
             if latent_path.is_file():
                 references.append((latent_path, index, speaker_id))
-                seen_speakers.add(speaker_id)
+                seen_works.add(work_id)
                 if len(references) >= count:
                     return references
     raise ValueError(

@@ -131,6 +131,7 @@ class TrainConfig:
     allow_tf32: bool = False
     compile_model: bool = False
     gradient_checkpointing: bool = False
+    data_parallel: bool = False
     train_mode: str = "rf"
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
@@ -153,7 +154,7 @@ class TrainConfig:
     checkpoint_latest_n: int = 0
     checkpoint_best_n: int = 0
     sample_every_epochs: int = 0
-    sample_cuda_visible_devices: str = "0"
+    sample_cuda_visible_devices: str = "1"
     sample_num_steps: int = 24
     sample_seconds: float = 5.0
     sample_seed: int = 20260715
@@ -192,6 +193,10 @@ class TrainConfig:
     wandb_entity: str | None = None
     wandb_run_name: str | None = None
     wandb_mode: str = "online"
+    tensorboard_enabled: bool = True
+    tensorboard_log_dir: str = "tensorboard"
+    tensorboard_launch: bool = False
+    tensorboard_port: int = 6006
     ddp_find_unused_parameters: bool = False
     lora_enabled: bool = False
     lora_r: int = 16
