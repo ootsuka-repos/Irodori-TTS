@@ -26,8 +26,8 @@ from irodori_tts.data_prep.ero_voice_classifier import SPACE_REPO_ID, SPACE_REVI
 from irodori_tts.data_prep.grok_stt import SILERO_VAD_REPO
 from irodori_tts.data_prep.nonverbal_clustering import BEATS_MODEL_NAME
 
-SCHEMA_VERSION = 2
-TEXT_TAG_SCHEMA = "ja_nonverbal_class_label_v2"
+SCHEMA_VERSION = 3
+TEXT_TAG_SCHEMA = "ja_nonverbal_class_transcript_label_v3"
 TARGET_CLASSES = ("aegi", "chupa")
 CLASS_TEXT = {
     "aegi": "喘ぎ声",
@@ -238,7 +238,18 @@ def _cluster_token(final_label: str, cluster: str | None) -> tuple[str | None, b
     return normalized, mismatch
 
 
-def render_nonverbal_text(final_label: str, cluster: str | None) -> str:
+def _clean_transcript_text(value: Any) -> str:
+    text = unicodedata.normalize("NFC", str(value or "")).strip()
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n+", " ", text)
+    return text.strip()
+
+
+def render_nonverbal_text(
+    final_label: str,
+    cluster: str | None,
+    transcript: str | None = None,
+) -> str:
     """Render the stable plain-text condition without adding tokenizer tokens.
 
     Standard examples are ``喘ぎ声。ラベルc0007。`` and
@@ -251,7 +262,28 @@ def render_nonverbal_text(final_label: str, cluster: str | None) -> str:
     token, mismatch = _cluster_token(label, cluster)
     if mismatch:
         raise ValueError(f"cluster {cluster!r} does not belong to class {label!r}")
-    return f"{CLASS_TEXT[label]}。ラベル{token or '未設定'}。"
+    prefix = f"{CLASS_TEXT[label]}。"
+    transcript_text = _clean_transcript_text(transcript)
+    if transcript_text:
+        prefix += transcript_text
+        if transcript_text[-1] not in "。！？!?…":
+            prefix += "。"
+    return f"{prefix}ラベル{token or '未設定'}。"
+
+
+def _usable_transcript(row: Mapping[str, Any]) -> str | None:
+    """Return corrected local-ASR text only when its provenance is usable."""
+    text = _clean_transcript_text(row.get("transcript_text"))
+    if not text or str(row.get("transcript_status", "ok")) == "error":
+        return None
+    correction = row.get("transcript_correction")
+    if isinstance(correction, Mapping) and correction.get("status") in {
+        "uncertain",
+        "rejected_unsafe",
+        "missing",
+    }:
+        return None
+    return text
 
 
 def _probability_payload(row: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -467,7 +499,12 @@ def prepare_nonverbal_training_rows(
         else:
             reasons = []
         confidence_details: list[str] = []
-        text = render_nonverbal_text(final_label, cluster if not cluster_mismatch else None)
+        transcript_text = _usable_transcript(source_row)
+        text = render_nonverbal_text(
+            final_label,
+            cluster if not cluster_mismatch else None,
+            transcript_text,
+        )
         confidence_details = _confidence_reasons(row, final_label, settings)
         if confidence_details:
             reasons.append("low_confidence")
@@ -515,6 +552,9 @@ def prepare_nonverbal_training_rows(
             row.setdefault("input_status", source_row.get("status"))
         row["text"] = text
         row["text_tag_schema"] = TEXT_TAG_SCHEMA
+        row["transcript_used"] = transcript_text is not None
+        if transcript_text is not None:
+            row["transcript_text"] = transcript_text
         row["effective_cluster"] = cluster
         row["cluster_token"] = cluster_token
         if confidence_details:
@@ -719,8 +759,10 @@ def _readme_text(
 
 既存の日本語 tokenizer をそのまま使い、特殊トークンは追加しません。
 `event_cluster` を優先し、未割当だけ `fallback_cluster` を使用します。
+anime-whisper と文脈校正で利用可能な文字起こしがある場合はclass名とラベルの間へ入れ、
+空・不確実・安全判定で棄却された文字起こしはclass名だけへフォールバックします。
 
-- `aegi_c0007` → `喘ぎ声。ラベルc0007。`
+- `aegi_c0007` + `あっ、んっ……` → `喘ぎ声。あっ、んっ……ラベルc0007。`
 - `chupa_k0012` → `フェラ音。ラベルk0012。`
 
 推論時も同じ文字列を人が入力できます。クラスタ番号は音響上の細分類で、意味名ではありません。
@@ -857,7 +899,8 @@ def write_nonverbal_training_manifests(
                 {
                     "final_label": "aegi",
                     "cluster": "aegi_c0007",
-                    "text": "喘ぎ声。ラベルc0007。",
+                    "transcript": "あっ、んっ……",
+                    "text": "喘ぎ声。あっ、んっ……ラベルc0007。",
                 },
                 {
                     "final_label": "chupa",

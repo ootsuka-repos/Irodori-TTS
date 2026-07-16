@@ -9,6 +9,7 @@ description = "Irodori-TTS training and inference codebase"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
+    "aiohttp>=3.11.0",
     "bitsandbytes>=0.49.2",
     "dacvae",
     "datasets>=3.0.0",
@@ -39,6 +40,9 @@ irodori-train = "irodori_tts.cli.train:main"
 irodori-infer = "irodori_tts.cli.infer:main"
 irodori-prepare-manifest = "irodori_tts.cli.prepare_manifest:main"
 irodori-prepare-grok-stt = "irodori_tts.cli.prepare_grok_stt:main"
+irodori-prepare-anime-whisper = "irodori_tts.cli.prepare_anime_whisper:main"
+irodori-correct-transcripts = "irodori_tts.cli.correct_transcripts:main"
+irodori-prepare-all = "irodori_tts.cli.prepare_all:main"
 irodori-cluster-nonverbal = "irodori_tts.cli.cluster_nonverbal:main"
 irodori-prepare-nonverbal-events = "irodori_tts.cli.prepare_nonverbal_events:main"
 irodori-prepare-nonverbal-training = "irodori_tts.cli.prepare_nonverbal_training:main"

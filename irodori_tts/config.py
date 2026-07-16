@@ -156,7 +156,8 @@ class TrainConfig:
     sample_every_epochs: int = 0
     sample_cuda_visible_devices: str = "1"
     sample_num_steps: int = 24
-    sample_seconds: float = 5.0
+    # None lets duration-enabled checkpoints predict a natural output length.
+    sample_seconds: float | None = None
     sample_seed: int = 20260715
     sample_reference_count: int = 3
     valid_ratio: float = 0.0

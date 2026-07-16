@@ -338,7 +338,7 @@ def _run_generation(
             speaker_kv_max_layers=None,
             t_schedule_mode=str(t_schedule_mode),
             sway_coeff=float(sway_coeff),
-            trim_tail=True,
+            trim_tail=False,
             lora_adapter=lora_adapter,
         ),
         log_fn=stdout_log,

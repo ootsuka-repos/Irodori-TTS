@@ -115,12 +115,17 @@ class PipelineConfig:
     keep_work_clips: bool = False
     force_classifier: bool = False
     force_finalize: bool = False
+    final_clip_padding_seconds: float = 0.35
 
     def __post_init__(self) -> None:
         if self.classifier_batch_size <= 0:
             raise ValueError("classifier_batch_size must be positive")
         if self.propagation_scope not in {"source", "global"}:
             raise ValueError("propagation_scope must be 'source' or 'global'")
+        if self.final_clip_padding_seconds < 0.0 or not math.isfinite(
+            self.final_clip_padding_seconds
+        ):
+            raise ValueError("final_clip_padding_seconds must be finite and non-negative")
 
 
 def _json_default(value: Any) -> Any:
@@ -203,6 +208,16 @@ def load_feature_shards(
     """Load matching JSONL/NPY BEATs shards and restore a stable global order."""
     root = Path(feature_dir)
     shard_dir = root / "embeddings" / "shards"
+    canonical_path = root / "windows.jsonl"
+    canonical_ids: set[str] | None = None
+    if canonical_path.is_file():
+        canonical_rows = _read_jsonl(canonical_path)
+        canonical_id_list = [str(row.get("id", "")) for row in canonical_rows]
+        if any(not segment_id for segment_id in canonical_id_list):
+            raise ValueError(f"Missing id in canonical feature manifest: {canonical_path}")
+        canonical_ids = set(canonical_id_list)
+        if len(canonical_ids) != len(canonical_id_list):
+            raise ValueError(f"Duplicate id in canonical feature manifest: {canonical_path}")
     metadata_paths = sorted(shard_dir.glob("*.jsonl"), key=lambda path: path.name.casefold())
     if not metadata_paths:
         raise RuntimeError(f"No feature metadata shards found under: {shard_dir}")
@@ -216,11 +231,22 @@ def load_feature_shards(
     dimensions: set[int] = set()
     seen_ids: set[str] = set()
     shard_summaries: list[dict[str, Any]] = []
+    ignored_rows = 0
+    ignored_shards = 0
     for metadata_path in metadata_paths:
         embedding_path = metadata_path.with_suffix(".npy")
         if not embedding_path.is_file():
             raise FileNotFoundError(f"Missing embedding shard for {metadata_path.name}")
         rows = _read_jsonl(metadata_path)
+        selected_indices = [
+            index
+            for index, row in enumerate(rows)
+            if canonical_ids is None or str(row.get("id", "")) in canonical_ids
+        ]
+        ignored_rows += len(rows) - len(selected_indices)
+        if not selected_indices:
+            ignored_shards += 1
+            continue
         embeddings = np.load(embedding_path, allow_pickle=False)
         if embeddings.ndim != 2 or embeddings.shape[0] != len(rows) or embeddings.shape[1] < 1:
             raise ValueError(
@@ -230,7 +256,8 @@ def load_feature_shards(
         if not np.isfinite(embeddings).all():
             raise ValueError(f"Embedding shard contains non-finite values: {embedding_path}")
         dimensions.add(int(embeddings.shape[1]))
-        for index, row in enumerate(rows):
+        for index in selected_indices:
+            row = rows[index]
             segment_id = str(row.get("id", ""))
             if not segment_id:
                 raise ValueError(f"Missing id at {metadata_path}:{index + 1}")
@@ -242,20 +269,35 @@ def load_feature_shards(
             {
                 "metadata": metadata_path.relative_to(root).as_posix(),
                 "embeddings": embedding_path.relative_to(root).as_posix(),
-                "rows": len(rows),
+                "rows": len(selected_indices),
             }
         )
+    if canonical_ids is not None:
+        missing_ids = canonical_ids - seen_ids
+        if missing_ids:
+            raise ValueError(
+                f"Canonical feature ids missing from embedding shards: {sorted(missing_ids)[:10]}"
+            )
     if len(dimensions) != 1:
         raise ValueError(f"Feature dimensions differ across shards: {sorted(dimensions)}")
     records.sort(key=lambda item: _row_sort_key(item[0]))
     rows = [row for row, _embedding in records]
     embeddings = np.stack([embedding for _row, embedding in records]).astype(np.float32)
-    return rows, embeddings, {
-        "shards": shard_summaries,
-        "shard_count": len(shard_summaries),
-        "rows": len(rows),
-        "dimensions": int(embeddings.shape[1]),
-    }
+    return (
+        rows,
+        embeddings,
+        {
+            "shards": shard_summaries,
+            "shard_count": len(shard_summaries),
+            "rows": len(rows),
+            "dimensions": int(embeddings.shape[1]),
+            "canonical_manifest": canonical_path.relative_to(root).as_posix()
+            if canonical_ids is not None
+            else None,
+            "ignored_stale_shards": ignored_shards,
+            "ignored_stale_rows": ignored_rows,
+        },
+    )
 
 
 def _normalize_path(value: str) -> str:
@@ -326,7 +368,9 @@ def match_manual_seed_intervals(
         for _index, row in by_source.get(source_key, []):
             start = float(row["start"])
             end = float(row["end"])
-            overlap = max(0.0, min(end, float(interval["end"])) - max(start, float(interval["start"])))
+            overlap = max(
+                0.0, min(end, float(interval["end"])) - max(start, float(interval["start"]))
+            )
             duration = end - start
             ratio = overlap / duration if duration > 0.0 else 0.0
             if ratio + 1e-12 < settings.minimum_overlap_ratio:
@@ -552,6 +596,7 @@ def export_audio_windows(
     data_root: Path,
     relative_prefix: Path,
     sample_rate: int,
+    padding_seconds: float = 0.0,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Export source crops atomically and return rows with root-relative audio paths."""
     grouped: dict[str, list[tuple[int, Mapping[str, Any]]]] = defaultdict(list)
@@ -571,8 +616,8 @@ def export_audio_windows(
                 else:
                     samples = _read_window(
                         reader,
-                        float(row["start"]),
-                        float(row["end"]),
+                        max(0.0, float(row["start"]) - padding_seconds),
+                        float(row["end"]) + padding_seconds,
                         sample_rate,
                     )
                     _atomic_write_flac(output_path, samples, sample_rate)
@@ -623,17 +668,23 @@ def filter_public_target_primitives(
     row_labels = [str(row.get("final_label", "uncertain")).strip().lower() for row in labeled_rows]
     mask = np.asarray([label in labels for label in row_labels], dtype=bool)
     internal_counts = Counter(row_labels)
-    discarded_counts = Counter(label for label, keep in zip(row_labels, mask, strict=True) if not keep)
+    discarded_counts = Counter(
+        label for label, keep in zip(row_labels, mask, strict=True) if not keep
+    )
     selected_rows = [dict(row) for row, keep in zip(labeled_rows, mask, strict=True) if keep]
     selected_embeddings = np.asarray(values[mask], dtype=np.float32)
-    return selected_rows, selected_embeddings, {
-        "input_primitive_count": len(labeled_rows),
-        "internal_label_counts": dict(sorted(internal_counts.items())),
-        "published_labels": list(labels),
-        "published_primitive_count": len(selected_rows),
-        "discarded_primitive_count": len(labeled_rows) - len(selected_rows),
-        "discarded_by_label": dict(sorted(discarded_counts.items())),
-    }
+    return (
+        selected_rows,
+        selected_embeddings,
+        {
+            "input_primitive_count": len(labeled_rows),
+            "internal_label_counts": dict(sorted(internal_counts.items())),
+            "published_labels": list(labels),
+            "published_primitive_count": len(selected_rows),
+            "discarded_primitive_count": len(labeled_rows) - len(selected_rows),
+            "discarded_by_label": dict(sorted(discarded_counts.items())),
+        },
+    )
 
 
 def filter_manual_applications_for_publication(
@@ -811,9 +862,7 @@ def _aggregate_prediction(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     positive = values[values > 0.0]
     entropy = -float(np.sum(positive * np.log(positive))) / math.log(len(ERO_LABELS))
     return {
-        "probabilities": {
-            label: float(values[index]) for index, label in enumerate(ERO_LABELS)
-        },
+        "probabilities": {label: float(values[index]) for index, label in enumerate(ERO_LABELS)},
         "top_label": ERO_LABELS[int(order[0])],
         "top_probability": float(values[int(order[0])]),
         "margin": float(values[int(order[0])] - values[int(order[1])]),
@@ -883,22 +932,19 @@ def _merge_group(
     first = rows[0]
     last = rows[-1]
     duration_weights = np.asarray([float(row["duration"]) for row in rows], dtype=np.float64)
-    combined = np.average(np.asarray(embeddings, dtype=np.float64), axis=0, weights=duration_weights)
+    combined = np.average(
+        np.asarray(embeddings, dtype=np.float64), axis=0, weights=duration_weights
+    )
     norm = float(np.linalg.norm(combined))
     if not math.isfinite(norm) or norm <= 1e-12:
         raise ValueError(f"Merged embedding has zero norm for {first['id']}")
     combined = (combined / norm).astype(np.float32)
     statuses = Counter(str(row["label_status"]) for row in rows)
     manual_ids = sorted(
-        {
-            str(interval_id)
-            for row in rows
-            for interval_id in row.get("manual_interval_ids", [])
-        }
+        {str(interval_id) for row in rows for interval_id in row.get("manual_interval_ids", [])}
     )
     boundaries = [
-        _shared_boundary(left, right)
-        for left, right in zip(rows[:-1], rows[1:], strict=True)
+        _shared_boundary(left, right) for left, right in zip(rows[:-1], rows[1:], strict=True)
     ]
     end = float(last["end"])
     event = {
@@ -913,9 +959,7 @@ def _merge_group(
         "primitive_count": len(rows),
         "primitive_ids": [str(row["id"]) for row in rows],
         "primitive_label_statuses": dict(sorted(statuses.items())),
-        "label_status": (
-            str(first["label_status"]) if len(statuses) == 1 else "merged_same_label"
-        ),
+        "label_status": (str(first["label_status"]) if len(statuses) == 1 else "merged_same_label"),
         "manual_interval_ids": manual_ids,
         "prediction": _aggregate_prediction(rows),
         "crossed_boundaries": boundaries,
@@ -965,10 +1009,9 @@ def merge_labeled_primitives(
             current = [index]
             continue
         previous = rows[current[-1]]
-        same_stream = (
-            str(previous.get("source_key")) == str(row.get("source_key"))
-            and int(previous.get("gap_index", -1)) == int(row.get("gap_index", -2))
-        )
+        same_stream = str(previous.get("source_key")) == str(row.get("source_key")) and int(
+            previous.get("gap_index", -1)
+        ) == int(row.get("gap_index", -2))
         adjacent = abs(float(previous["end"]) - float(row["start"])) <= (
             settings.adjacency_tolerance_seconds
         )
@@ -1156,9 +1199,7 @@ def _dataset_summary(
             int(selection_summary["published_primitive_count"]) - len(rows)
         ),
         "class_counts": dict(sorted(counts.items())),
-        "class_hours": {
-            label: seconds[label] / 3_600 for label in sorted(seconds)
-        },
+        "class_hours": {label: seconds[label] / 3_600 for label in sorted(seconds)},
         "manual_interval_count": len(manual_applications),
         "manual_seed_count": len(
             {
@@ -1291,6 +1332,7 @@ def run_nonverbal_event_pipeline(
         "propagate_manual_seeds": settings.propagate_manual_seeds,
         "lock_confident_usual": settings.lock_confident_usual,
         "reject_target_class_conflicts": settings.reject_target_class_conflicts,
+        "final_clip_padding_seconds": settings.final_clip_padding_seconds,
         "manual_seed": asdict(manual_settings),
         "labeling": asdict(label_settings),
         "merge": asdict(merge_settings),
@@ -1369,8 +1411,8 @@ def run_nonverbal_event_pipeline(
             }
         )
 
-    published_primitives, published_embeddings, selection_summary = (
-        filter_public_target_primitives(labeled_primitives, primitive_embeddings)
+    published_primitives, published_embeddings, selection_summary = filter_public_target_primitives(
+        labeled_primitives, primitive_embeddings
     )
     event_rows, event_embeddings = merge_labeled_primitives(
         published_primitives,
@@ -1384,14 +1426,10 @@ def run_nonverbal_event_pipeline(
     short_event_rows = [
         row for row, keep in zip(event_rows, duration_mask, strict=True) if not keep
     ]
-    event_rows = [
-        row for row, keep in zip(event_rows, duration_mask, strict=True) if keep
-    ]
+    event_rows = [row for row, keep in zip(event_rows, duration_mask, strict=True) if keep]
     event_embeddings = np.asarray(event_embeddings[duration_mask], dtype=np.float32)
     retained_primitive_ids = {
-        str(primitive_id)
-        for row in event_rows
-        for primitive_id in row.get("primitive_ids", [])
+        str(primitive_id) for row in event_rows for primitive_id in row.get("primitive_ids", [])
     }
     target_primitive_count = len(published_primitives)
     published_primitives = [
@@ -1402,9 +1440,7 @@ def run_nonverbal_event_pipeline(
         "target_primitive_count": target_primitive_count,
         "published_primitive_count": len(published_primitives),
         "discarded_short_event_count": len(short_event_rows),
-        "discarded_short_primitive_count": (
-            target_primitive_count - len(published_primitives)
-        ),
+        "discarded_short_primitive_count": (target_primitive_count - len(published_primitives)),
         "minimum_published_event_seconds": merge_settings.minimum_seconds,
         "discarded_primitive_count": (
             int(selection_summary["input_primitive_count"]) - len(published_primitives)
@@ -1427,6 +1463,7 @@ def run_nonverbal_event_pipeline(
         data_root=source_root,
         relative_prefix=Path("clips"),
         sample_rate=FINAL_CLIP_SAMPLE_RATE,
+        padding_seconds=settings.final_clip_padding_seconds,
     )
     folder_summary = materialize_class_folders(event_rows, dataset_dir=stage)
     clean_primitives = [

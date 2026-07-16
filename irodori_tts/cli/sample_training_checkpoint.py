@@ -14,7 +14,6 @@ from irodori_tts.inference.runtime import (
     save_wav,
 )
 
-
 SAMPLES = (
     ("normal", "先生、今日も一日お疲れ様でした。ゆっくり休んでくださいね。"),
     ("aegi", "あっ、あっ、んっ……だめ、気持ちいい……！"),
@@ -64,7 +63,12 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--num-steps", type=int, default=24)
-    parser.add_argument("--seconds", type=float, default=5.0)
+    parser.add_argument(
+        "--seconds",
+        type=float,
+        default=None,
+        help="Manual duration; omit to use the checkpoint duration predictor.",
+    )
     parser.add_argument("--seed", type=int, default=20260715)
     parser.add_argument("--reference-count", type=int, default=3)
     args = parser.parse_args()
@@ -92,7 +96,8 @@ def main() -> None:
                     SamplingRequest(
                         text=text,
                         ref_latent=str(ref_latent),
-                        seconds=float(args.seconds),
+                        seconds=None if args.seconds is None else float(args.seconds),
+                        trim_tail=False,
                         num_steps=int(args.num_steps),
                         seed=int(args.seed),
                     ),
@@ -123,7 +128,7 @@ def main() -> None:
         "checkpoint": checkpoint.as_posix(),
         "reference_count": len(references),
         "num_steps": int(args.num_steps),
-        "seconds": float(args.seconds),
+        "seconds": None if args.seconds is None else float(args.seconds),
         "samples": generated,
     }
     (output_dir / "metadata.json").write_text(

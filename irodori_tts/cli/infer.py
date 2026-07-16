@@ -118,7 +118,7 @@ def main() -> None:
     parser.add_argument(
         "--codec-deterministic-encode",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Use deterministic DACVAE encode path (default: enabled).",
     )
     parser.add_argument(
@@ -149,7 +149,7 @@ def main() -> None:
         help=(
             "Scale reference audio down only when peak exceeds 1.0 after optional loudness "
             "normalization. Effective only when --ref-normalize-db is none/null/off "
-            "(default: enabled)."
+            "(default: disabled to preserve quiet vocal tails)."
         ),
     )
     parser.add_argument("--codec-repo", default="Aratako/Semantic-DACVAE-Japanese-32dim")

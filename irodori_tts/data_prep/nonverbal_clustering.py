@@ -35,6 +35,10 @@ BEATS_CHECKPOINT_FILENAME = "BEATs_iter3_plus_AS2M.pt"
 BEATS_CHECKPOINT_SHA256 = "d43cbfad4d7b56381c061d7a24774f908d4d94c72961f6eb1d9090ff18cd8d34"
 BEATS_MODEL_NAME = "Microsoft BEATs Iter3+ AS2M (pre-trained)"
 BEATS_SAMPLE_RATE = 16_000
+# The pinned BEATs frontend uses 25 ms frames, a 10 ms frame shift, and a
+# 16-frame patch kernel.  Short acoustic primitives still contain useful tail
+# audio, so preserve them and pad the model input instead of dropping them.
+BEATS_MIN_INPUT_SAMPLES = 400 + (16 - 1) * 160
 OUTPUT_SAMPLE_RATE = 48_000
 
 
@@ -128,6 +132,17 @@ def _atomic_save_npy(path: Path, array: np.ndarray) -> None:
     with temporary.open("wb") as handle:
         np.save(handle, array, allow_pickle=False)
     temporary.replace(path)
+
+
+def _prune_stale_embedding_shards(shard_dir: Path, active_source_keys: set[str]) -> int:
+    """Remove completed-run shards that no longer belong to the current inventory."""
+    removed = 0
+    for path in shard_dir.iterdir():
+        if path.is_file() and path.suffix in {".jsonl", ".npy"}:
+            if path.stem not in active_source_keys:
+                path.unlink()
+                removed += 1
+    return removed
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -280,9 +295,7 @@ def _fixed_primitives(duration: float, max_seconds: float) -> list[AcousticPrimi
                 end=end,
                 left_boundary_reason="gap_start" if index == 0 else "fixed_even",
                 left_boundary_score=1.0 if index == 0 else 0.0,
-                right_boundary_reason=(
-                    "gap_end" if index == len(intervals) - 1 else "fixed_even"
-                ),
+                right_boundary_reason=("gap_end" if index == len(intervals) - 1 else "fixed_even"),
                 right_boundary_score=1.0 if index == len(intervals) - 1 else 0.0,
             )
         )
@@ -295,16 +308,44 @@ def load_vad_complements(
     data_root: Path,
     feature_config: FeatureConfig,
     max_sources: int | None = None,
+    min_source_seconds: float = 0.0,
     source_shard_index: int = 0,
     source_shard_count: int = 1,
     segmentation_device: str | torch.device = "cpu",
 ) -> tuple[list[CandidateWindow], list[dict[str, Any]], dict[str, Any]]:
     """Build exact-cover natural candidates from cached raw VAD responses."""
+    if min_source_seconds < 0:
+        raise ValueError("min_source_seconds must be non-negative")
     raw_paths = sorted(raw_response_dir.glob("*.json"), key=lambda path: path.name.casefold())
+    eligible_paths: list[Path] = []
+    excluded_sources: list[dict[str, Any]] = []
+    for raw_path in raw_paths:
+        payload = json.loads(raw_path.read_text(encoding="utf-8"))
+        metadata = payload.get("metadata")
+        source_meta = metadata.get("source") if isinstance(metadata, dict) else None
+        if not isinstance(source_meta, dict) or "duration" not in source_meta:
+            raise ValueError(f"Cached response has no source duration: {raw_path}")
+        source_duration = float(source_meta["duration"])
+        if source_duration <= min_source_seconds:
+            excluded_sources.append(
+                {
+                    "source_uid": str(source_meta.get("source_id") or raw_path.stem),
+                    "source_audio": str(source_meta.get("relative_path") or ""),
+                    "duration": round(source_duration, 6),
+                    "reason": "source_duration_at_or_below_threshold",
+                    "threshold_seconds": min_source_seconds,
+                }
+            )
+        else:
+            eligible_paths.append(raw_path)
+    raw_paths = eligible_paths
     if max_sources is not None:
         raw_paths = raw_paths[:max_sources]
     if not raw_paths:
-        raise RuntimeError(f"No raw response JSON files found under: {raw_response_dir}")
+        raise RuntimeError(
+            f"No eligible raw response JSON files found under: {raw_response_dir} "
+            f"(duration must be greater than {min_source_seconds:.3f}s)"
+        )
     if source_shard_count <= 0:
         raise ValueError("source_shard_count must be positive")
     if not 0 <= source_shard_index < source_shard_count:
@@ -315,7 +356,7 @@ def load_vad_complements(
         raise RuntimeError("CUDA acoustic segmentation was requested, but CUDA is unavailable")
 
     candidates: list[CandidateWindow] = []
-    excluded: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = list(excluded_sources)
     source_summaries: list[dict[str, Any]] = []
     total_duration = 0.0
     total_vad_seconds = 0.0
@@ -460,7 +501,9 @@ def load_vad_complements(
         "vad_audio_hours": total_vad_seconds / 3600,
         "outside_vad_hours": total_outside_seconds / 3600,
         "candidate_windows": len(candidates),
-        "excluded_short_gaps": len(excluded),
+        "min_source_seconds": min_source_seconds,
+        "excluded_short_sources": len(excluded_sources),
+        "excluded_short_gaps": len(excluded) - len(excluded_sources),
         "sources_detail": source_summaries,
     }
     return candidates, excluded, summary
@@ -541,7 +584,10 @@ def _pool_beats_batch(
     """Pool one model-sized batch without normalizing individual rows."""
     if not waveforms:
         raise ValueError("waveforms cannot be empty")
-    batch_samples = max(int(waveform.numel()) for waveform in waveforms)
+    batch_samples = max(
+        BEATS_MIN_INPUT_SAMPLES,
+        max(int(waveform.numel()) for waveform in waveforms),
+    )
     if batch_samples <= 0:
         raise ValueError("waveforms must contain at least one sample")
     batch = torch.zeros((len(waveforms), batch_samples), dtype=torch.float32)
@@ -773,6 +819,9 @@ def extract_beats_embeddings(
         raise RuntimeError("Combined embedding/metadata row count mismatch")
     if write_combined:
         _atomic_save_npy(output_dir / "embeddings" / "beats.npy", embeddings)
+    removed_shards = _prune_stale_embedding_shards(shard_dir, set(grouped))
+    if removed_shards:
+        print(f"features pruned_stale_shard_files={removed_shards}", flush=True)
     return embeddings, all_rows
 
 
@@ -1390,6 +1439,7 @@ def run_nonverbal_clustering(
     feature_config: FeatureConfig,
     cluster_config: ClusterConfig,
     max_sources: int | None = None,
+    min_source_seconds: float = 0.0,
     force_features: bool = False,
     source_shard_index: int = 0,
     source_shard_count: int = 1,
@@ -1403,6 +1453,7 @@ def run_nonverbal_clustering(
         data_root=data_root,
         feature_config=feature_config,
         max_sources=max_sources,
+        min_source_seconds=min_source_seconds,
         source_shard_index=source_shard_index,
         source_shard_count=source_shard_count,
         segmentation_device=device,

@@ -306,13 +306,13 @@ def run_epoch_test_inference(
         str(sample_dir.resolve()),
         "--num-steps",
         str(train_cfg.sample_num_steps),
-        "--seconds",
-        str(train_cfg.sample_seconds),
         "--seed",
         str(train_cfg.sample_seed),
         "--reference-count",
         str(train_cfg.sample_reference_count),
     ]
+    if train_cfg.sample_seconds is not None:
+        command.extend(("--seconds", str(train_cfg.sample_seconds)))
     child_env = os.environ.copy()
     child_env["CUDA_VISIBLE_DEVICES"] = str(train_cfg.sample_cuda_visible_devices)
     child_env["PYTHONUNBUFFERED"] = "1"
@@ -2133,7 +2133,7 @@ def main() -> None:
         )
     if train_cfg.sample_num_steps <= 0:
         raise ValueError(f"sample_num_steps must be > 0, got {train_cfg.sample_num_steps}")
-    if train_cfg.sample_seconds <= 0:
+    if train_cfg.sample_seconds is not None and train_cfg.sample_seconds <= 0:
         raise ValueError(f"sample_seconds must be > 0, got {train_cfg.sample_seconds}")
     if train_cfg.sample_reference_count <= 0:
         raise ValueError(

@@ -76,6 +76,12 @@ def _parse_args() -> argparse.Namespace:
         help="Allow pinned classifier files to be fetched when they are absent locally.",
     )
     parser.add_argument("--classifier-batch-size", type=int, default=64)
+    parser.add_argument(
+        "--final-clip-padding-seconds",
+        type=float,
+        default=0.35,
+        help="Context retained before and after each finalized event (default: 0.35).",
+    )
     parser.add_argument("--manual-overlap-ratio", type=float, default=0.50)
     parser.add_argument(
         "--propagation-scope",
@@ -148,6 +154,7 @@ def main() -> None:
             keep_work_clips=args.keep_work_clips,
             force_classifier=args.force_classifier,
             force_finalize=args.force_finalize,
+            final_clip_padding_seconds=args.final_clip_padding_seconds,
         ),
         visualization_hook=_write_default_report,
     )

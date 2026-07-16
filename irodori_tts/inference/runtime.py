@@ -197,7 +197,9 @@ class SamplingRequest:
     seed: int | None = None
     t_schedule_mode: str = "linear"
     sway_coeff: float = -1.0
-    trim_tail: bool = True
+    # Generated low-energy tails can be meaningful breath or vocal decay. Opt in
+    # to heuristic trimming instead of discarding them by default.
+    trim_tail: bool = False
     tail_window_size: int = 20
     tail_std_threshold: float = 0.05
     tail_mean_threshold: float = 0.1

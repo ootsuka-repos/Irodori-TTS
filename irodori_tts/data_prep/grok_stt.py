@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
 import mimetypes
 import os
 import re
+import subprocess
 import time
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from typing import Any, Protocol
+from urllib.parse import urlencode
 
+import aiohttp
 import numpy as np
 import requests
 import soundfile as sf
@@ -23,6 +28,7 @@ import torch
 import torchaudio
 
 XAI_STT_ENDPOINT = "https://api.x.ai/v1/stt"
+XAI_STT_WEBSOCKET_ENDPOINT = "wss://api.x.ai/v1/stt"
 XAI_BATCH_PRICE_USD_PER_HOUR = 0.10
 XAI_MAX_FILE_BYTES = 500_000_000
 STT_CACHE_STRATEGY = "silero-vad-v1"
@@ -127,7 +133,9 @@ class SegmentationConfig:
     # A one-second boundary produced fragments such as "じゃ" + "あ…".
     hard_gap_seconds: float = 2.0
     soft_gap_seconds: float = 0.20
-    padding_seconds: float = 0.12
+    # Preserve breath attacks and low-energy decay that word timestamps and VAD
+    # commonly underestimate.
+    padding_seconds: float = 0.35
     min_chars_per_second: float = 0.20
     max_chars_per_second: float = 20.0
 
@@ -213,6 +221,15 @@ class SileroVADConfig:
             raise ValueError("VAD max join gap must be non-negative")
         if self.max_upload_duration_s <= 0:
             raise ValueError("VAD max upload duration must be positive")
+
+
+@dataclass(frozen=True)
+class VADPlan:
+    """Cached GPU-VAD output consumed independently by STT workers."""
+
+    regions: tuple[tuple[float, float], ...]
+    upload_ranges: tuple[tuple[float, float], ...]
+    cached: bool = False
 
 
 @dataclass(frozen=True)
@@ -481,7 +498,11 @@ def _write_upload_chunk(
     )
 
 
-def load_silero_vad(repo: str = SILERO_VAD_REPO) -> tuple[Any, Callable[..., Any]]:
+def load_silero_vad(
+    repo: str = SILERO_VAD_REPO,
+    *,
+    device: str | torch.device = "cpu",
+) -> tuple[Any, Callable[..., Any]]:
     """Load the pinned official Silero VAD JIT model without its pip dependency cap."""
     torch.set_num_threads(1)
     model, utils = torch.hub.load(
@@ -492,6 +513,7 @@ def load_silero_vad(repo: str = SILERO_VAD_REPO) -> tuple[Any, Callable[..., Any
         force_reload=False,
     )
     get_speech_timestamps = utils[0]
+    model = model.to(torch.device(device)).eval()
     return model, get_speech_timestamps
 
 
@@ -533,6 +555,11 @@ def detect_speech_regions(
     config.validate()
     sample_rate = 16_000
     waveform = _load_vad_waveform(source, target_sample_rate=sample_rate)
+    try:
+        model_device = next(model.parameters()).device
+    except (AttributeError, StopIteration):
+        model_device = torch.device("cpu")
+    waveform = waveform.to(model_device)
     timestamps = get_speech_timestamps(
         waveform,
         model,
@@ -592,6 +619,87 @@ def pack_speech_regions(
     return packed
 
 
+def _vad_plan_path(output_dir: Path, source: AudioSource) -> Path:
+    return output_dir / "vad_plans" / f"{source.source_id}.json"
+
+
+def _parse_vad_ranges(value: Any) -> tuple[tuple[float, float], ...] | None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return None
+    parsed: list[tuple[float, float]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            return None
+        start = _safe_float(item.get("start"))
+        end = _safe_float(item.get("end"))
+        if start is None or end is None or start < 0 or end <= start:
+            return None
+        parsed.append((start, end))
+    return tuple(parsed)
+
+
+def prepare_vad_plan(
+    source: AudioSource,
+    *,
+    output_dir: Path,
+    config: SileroVADConfig,
+    model: Any,
+    get_speech_timestamps: Callable[..., Any],
+) -> VADPlan:
+    """Load or compute a resumable VAD plan before any network STT work."""
+    config.validate()
+    path = _vad_plan_path(output_dir, source)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        payload = None
+    if isinstance(payload, Mapping):
+        metadata = payload.get("metadata")
+        regions = _parse_vad_ranges(payload.get("regions"))
+        upload_ranges = _parse_vad_ranges(payload.get("upload_ranges"))
+        if (
+            isinstance(metadata, Mapping)
+            and metadata.get("strategy") == "silero-vad-plan-v1"
+            and metadata.get("source") == source.metadata()
+            and metadata.get("config") == asdict(config)
+            and regions is not None
+            and upload_ranges is not None
+        ):
+            return VADPlan(regions=regions, upload_ranges=upload_ranges, cached=True)
+
+    regions = tuple(
+        detect_speech_regions(
+            source,
+            config=config,
+            model=model,
+            get_speech_timestamps=get_speech_timestamps,
+        )
+    )
+    upload_ranges = tuple(
+        pack_speech_regions(
+            regions,
+            max_duration=config.max_upload_duration_s,
+            max_gap=config.max_join_gap_s,
+        )
+    )
+    _atomic_write_json(
+        path,
+        {
+            "metadata": {
+                "strategy": "silero-vad-plan-v1",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "source": source.metadata(),
+                "config": asdict(config),
+            },
+            "regions": [{"start": round(start, 6), "end": round(end, 6)} for start, end in regions],
+            "upload_ranges": [
+                {"start": round(start, 6), "end": round(end, 6)} for start, end in upload_ranges
+            ],
+        },
+    )
+    return VADPlan(regions=regions, upload_ranges=upload_ranges, cached=False)
+
+
 def _word_payload(word: Word) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "text": word.text,
@@ -606,7 +714,7 @@ def _word_payload(word: Word) -> dict[str, Any]:
 
 
 def transcribe_source_chunked(
-    client: GrokSTTClient,
+    client: STTClient,
     source: AudioSource,
     options: TranscriptionOptions,
     *,
@@ -724,8 +832,47 @@ def transcribe_source_chunked(
     )
 
 
+def transcribe_source_from_vad_plan(
+    client: STTClient,
+    source: AudioSource,
+    options: TranscriptionOptions,
+    *,
+    output_dir: Path,
+    config: SileroVADConfig,
+    plan: VADPlan,
+    reuse_chunks: bool = True,
+    progress: Callable[[int, int, bool], None] | None = None,
+) -> Path:
+    """Consume a prepared GPU-VAD plan without blocking further VAD inference."""
+    chunking = ChunkingConfig(seconds=config.max_upload_duration_s, overlap_seconds=0.0)
+    return transcribe_source_chunked(
+        client,
+        source,
+        options,
+        output_dir=output_dir,
+        config=chunking,
+        ranges=plan.upload_ranges,
+        processing={
+            "vad": asdict(config),
+            "vad_regions": len(plan.regions),
+            "vad_plan_cached": plan.cached,
+        },
+        response_metadata={
+            "vad_regions": [
+                {"start": round(start, 6), "end": round(end, 6)} for start, end in plan.regions
+            ],
+            "upload_regions": [
+                {"start": round(start, 6), "end": round(end, 6)}
+                for start, end in plan.upload_ranges
+            ],
+        },
+        reuse_chunks=reuse_chunks,
+        progress=progress,
+    )
+
+
 def transcribe_source_with_vad(
-    client: GrokSTTClient,
+    client: STTClient,
     source: AudioSource,
     options: TranscriptionOptions,
     *,
@@ -736,38 +883,471 @@ def transcribe_source_with_vad(
     reuse_chunks: bool = True,
     progress: Callable[[int, int, bool], None] | None = None,
 ) -> Path:
-    """Detect utterances with Silero, transcribe packed regions, and preserve source times."""
-    regions = detect_speech_regions(
+    """Prepare a resumable Silero VAD plan, then transcribe its packed regions."""
+    plan = prepare_vad_plan(
         source,
+        output_dir=output_dir,
         config=config,
         model=model,
         get_speech_timestamps=get_speech_timestamps,
     )
-    upload_ranges = pack_speech_regions(
-        regions,
-        max_duration=config.max_upload_duration_s,
-        max_gap=config.max_join_gap_s,
-    )
-    chunking = ChunkingConfig(seconds=config.max_upload_duration_s, overlap_seconds=0.0)
-    return transcribe_source_chunked(
+    return transcribe_source_from_vad_plan(
         client,
         source,
         options,
         output_dir=output_dir,
-        config=chunking,
-        ranges=upload_ranges,
-        processing={"vad": asdict(config), "vad_regions": len(regions)},
-        response_metadata={
-            "vad_regions": [
-                {"start": round(start, 6), "end": round(end, 6)} for start, end in regions
-            ],
-            "upload_regions": [
-                {"start": round(start, 6), "end": round(end, 6)} for start, end in upload_ranges
-            ],
-        },
+        config=config,
+        plan=plan,
         reuse_chunks=reuse_chunks,
         progress=progress,
     )
+
+
+class STTClient(Protocol):
+    """Common interface used by the REST and Grok-subscription STT transports."""
+
+    endpoint: str
+
+    def transcribe(
+        self,
+        source: AudioSource,
+        options: TranscriptionOptions,
+    ) -> dict[str, Any]: ...
+
+
+@dataclass(frozen=True)
+class _GrokCredential:
+    access_token: str = field(repr=False)
+    expires_at: datetime | None = None
+    auth_mode: str | None = None
+
+
+def _parse_auth_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    # Grok CLI currently serializes nanoseconds while datetime accepts
+    # microseconds. Truncation is sufficient for refresh-margin checks.
+    normalized = re.sub(
+        r"(\.\d{6})\d+(?=(?:[+-]\d{2}:\d{2})?$)",
+        r"\1",
+        normalized,
+    )
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+class GrokSubscriptionAuth:
+    """Read and refresh the OAuth session managed by the installed Grok CLI."""
+
+    def __init__(
+        self,
+        *,
+        auth_file: Path | None = None,
+        cli_command: str = "grok",
+        refresh_margin_seconds: float = 300.0,
+        cli_timeout_seconds: float = 60.0,
+    ) -> None:
+        if refresh_margin_seconds < 0:
+            raise ValueError("refresh_margin_seconds must be non-negative")
+        if cli_timeout_seconds <= 0:
+            raise ValueError("cli_timeout_seconds must be positive")
+        if not cli_command.strip():
+            raise ValueError("The Grok CLI command is empty")
+        self.auth_file = (
+            auth_file.expanduser().resolve()
+            if auth_file is not None
+            else (Path.home() / ".grok" / "auth.json").resolve()
+        )
+        self.cli_command = cli_command.strip()
+        self.refresh_margin = timedelta(seconds=refresh_margin_seconds)
+        self.cli_timeout_seconds = cli_timeout_seconds
+        self._credential: _GrokCredential | None = None
+        self._lock = Lock()
+
+    def _read_credential(self) -> _GrokCredential:
+        try:
+            payload = json.loads(self.auth_file.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"Grok CLI login file was not found: {self.auth_file}. Run `grok login`."
+            ) from exc
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Could not read Grok CLI login state: {self.auth_file}") from exc
+        if not isinstance(payload, Mapping):
+            raise RuntimeError(f"Unexpected Grok CLI login format: {self.auth_file}")
+
+        candidates: list[tuple[bool, float, Mapping[str, Any]]] = []
+        for value in payload.values():
+            if not isinstance(value, Mapping):
+                continue
+            token = value.get("key")
+            if not isinstance(token, str) or not token.strip():
+                continue
+            expires_at = _parse_auth_timestamp(value.get("expires_at"))
+            expiry_score = expires_at.timestamp() if expires_at is not None else float("inf")
+            is_subscription = bool(value.get("refresh_token")) or str(
+                value.get("auth_mode", "")
+            ).lower() in {"oauth", "subscription", "grok.com"}
+            candidates.append((is_subscription, expiry_score, value))
+        if not candidates:
+            raise RuntimeError(
+                f"No usable Grok CLI credential was found in {self.auth_file}. Run `grok login`."
+            )
+        _, _, selected = max(candidates, key=lambda item: (item[0], item[1]))
+        return _GrokCredential(
+            access_token=str(selected["key"]).strip(),
+            expires_at=_parse_auth_timestamp(selected.get("expires_at")),
+            auth_mode=str(selected.get("auth_mode")) if selected.get("auth_mode") else None,
+        )
+
+    def _is_fresh(self, credential: _GrokCredential) -> bool:
+        return credential.expires_at is None or (
+            credential.expires_at > datetime.now(timezone.utc) + self.refresh_margin
+        )
+
+    def _refresh_with_cli(self) -> None:
+        environment = os.environ.copy()
+        environment["PYTHONUTF8"] = "1"
+        try:
+            result = subprocess.run(
+                [self.cli_command, "models"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.cli_timeout_seconds,
+                env=environment,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Grok CLI executable was not found: {self.cli_command!r}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Timed out while refreshing the Grok CLI login") from exc
+        if result.returncode != 0:
+            diagnostic = (result.stderr or result.stdout).strip().replace("\n", " ")[:500]
+            suffix = f": {diagnostic}" if diagnostic else ""
+            raise RuntimeError(f"`grok models` could not validate the subscription login{suffix}")
+
+    def access_token(self, *, force_refresh: bool = False) -> str:
+        """Return a fresh bearer without ever exposing it in logs or metadata."""
+        with self._lock:
+            if (
+                not force_refresh
+                and self._credential is not None
+                and self._is_fresh(self._credential)
+            ):
+                return self._credential.access_token
+            if not force_refresh:
+                credential = self._read_credential()
+                if self._is_fresh(credential):
+                    self._credential = credential
+                    return credential.access_token
+            self._refresh_with_cli()
+            credential = self._read_credential()
+            if not self._is_fresh(credential):
+                raise RuntimeError(
+                    "Grok CLI login remained expired after refresh; run `grok login` interactively"
+                )
+            self._credential = credential
+            return credential.access_token
+
+    def validate(self) -> dict[str, Any]:
+        """Refresh once and return only non-secret diagnostics for preflight output."""
+        self.access_token(force_refresh=True)
+        assert self._credential is not None
+        return {
+            "auth_file": self.auth_file.as_posix(),
+            "auth_mode": self._credential.auth_mode,
+            "expires_at": (
+                self._credential.expires_at.isoformat()
+                if self._credential.expires_at is not None
+                else None
+            ),
+        }
+
+
+def _load_pcm16_mono(source: AudioSource, *, sample_rate: int = 16_000) -> bytes:
+    with sf.SoundFile(source.path) as reader:
+        audio = reader.read(dtype="float32", always_2d=True)
+        source_rate = int(reader.samplerate)
+    if audio.size == 0 or not np.isfinite(audio).all():
+        raise ValueError(f"STT audio is empty or non-finite: {source.path}")
+    mono = np.mean(audio, axis=1, dtype=np.float32)
+    waveform = torch.from_numpy(mono.copy())
+    if source_rate != sample_rate:
+        waveform = torchaudio.functional.resample(waveform, source_rate, sample_rate)
+    values = waveform.detach().cpu().numpy()
+    pcm = np.clip(np.rint(values * 32768.0), -32768, 32767).astype("<i2")
+    return pcm.tobytes()
+
+
+def streaming_events_to_response(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    duration: float,
+    default_language: str,
+) -> dict[str, Any]:
+    """Collapse repeated streaming finals into one REST-compatible response."""
+    partials: dict[tuple[int, float], Mapping[str, Any]] = {}
+    completed: dict[int, Mapping[str, Any]] = {}
+    languages: list[str] = []
+    response_duration = duration
+    for event in events:
+        language = event.get("language")
+        if isinstance(language, str) and language:
+            languages.append(language)
+        event_duration = _safe_float(event.get("duration"))
+        if event.get("type") == "transcript.done" and event_duration is not None:
+            response_duration = max(response_duration, event_duration)
+        channel = int(event.get("channel_index", 0))
+        words = event.get("words")
+        has_words = (
+            isinstance(words, Sequence) and not isinstance(words, (str, bytes)) and bool(words)
+        )
+        has_text = isinstance(event.get("text"), str) and bool(str(event.get("text")).strip())
+        if event.get("type") == "transcript.done":
+            if has_words or has_text:
+                completed[channel] = event
+            continue
+        if event.get("type") != "transcript.partial" or event.get("is_final") is not True:
+            continue
+        if not has_words and not has_text:
+            continue
+        start = _safe_float(event.get("start"))
+        if start is None and has_words:
+            first = words[0]
+            start = _safe_float(first.get("start")) if isinstance(first, Mapping) else None
+        partials[(channel, round(start or 0.0, 4))] = event
+
+    selected: list[Mapping[str, Any]] = []
+    channels = {channel for channel, _ in partials} | set(completed)
+    for channel in sorted(channels):
+        if channel in completed:
+            selected.append(completed[channel])
+        else:
+            selected.extend(
+                event
+                for (event_channel, _), event in sorted(partials.items())
+                if event_channel == channel
+            )
+
+    words_out: list[Word] = []
+    seen: set[tuple[float, float, str, str]] = set()
+    for event in selected:
+        parsed = parse_words(event)
+        if not parsed:
+            text = str(event.get("text", "")).strip()
+            start = _safe_float(event.get("start")) or 0.0
+            event_duration = _safe_float(event.get("duration")) or 0.0
+            if text and event_duration > 0:
+                parsed = [Word(text=text, start=start, end=start + event_duration)]
+        for word in parsed:
+            key = (
+                round(word.start, 4),
+                round(word.end, 4),
+                word.text,
+                str(word.speaker),
+            )
+            if key not in seen:
+                seen.add(key)
+                words_out.append(word)
+    words_out.sort(key=lambda word: (word.start, word.end, word.text))
+    return {
+        "text": join_word_tokens([word.text for word in words_out]),
+        "language": max(set(languages), key=languages.count) if languages else default_language,
+        "duration": round(response_duration, 6),
+        "words": [_word_payload(word) for word in words_out],
+        "transport": "grok-cli-subscription-websocket",
+    }
+
+
+class _GrokStreamingAuthError(RuntimeError):
+    pass
+
+
+class _GrokStreamingRetryableError(RuntimeError):
+    pass
+
+
+class GrokSubscriptionSTTClient:
+    """Streaming STT client authenticated by the user's Grok CLI subscription."""
+
+    def __init__(
+        self,
+        auth: GrokSubscriptionAuth,
+        *,
+        endpoint: str = XAI_STT_WEBSOCKET_ENDPOINT,
+        endpointing_ms: int = 350,
+        frame_milliseconds: int = 100,
+        realtime_factor: float = 0.0,
+        timeout_seconds: float = 3600.0,
+        max_retries: int = 4,
+    ) -> None:
+        if not endpoint.strip():
+            raise ValueError("The xAI streaming STT endpoint is empty")
+        if not 0 <= endpointing_ms <= 5000:
+            raise ValueError("endpointing_ms must be between 0 and 5000")
+        if frame_milliseconds <= 0:
+            raise ValueError("frame_milliseconds must be positive")
+        if realtime_factor < 0:
+            raise ValueError("realtime_factor must be non-negative")
+        if timeout_seconds <= 0 or max_retries < 0:
+            raise ValueError("Invalid streaming STT retry settings")
+        self.auth = auth
+        self.endpoint = endpoint.strip()
+        self.endpointing_ms = endpointing_ms
+        self.frame_milliseconds = frame_milliseconds
+        self.realtime_factor = realtime_factor
+        self.timeout_seconds = timeout_seconds
+        self.max_retries = max_retries
+
+    def _url(self, options: TranscriptionOptions) -> str:
+        if options.multichannel:
+            raise ValueError(
+                "Grok subscription STT receives mono VAD chunks; use --auth-mode api-key "
+                "for --multichannel"
+            )
+        params: list[tuple[str, str]] = [
+            ("sample_rate", "16000"),
+            ("encoding", "pcm"),
+            ("interim_results", "false"),
+            ("endpointing", str(self.endpointing_ms)),
+            ("language", options.language),
+            ("diarize", str(options.diarize).lower()),
+            ("filler_words", str(options.filler_words).lower()),
+        ]
+        params.extend(("keyterm", term) for term in options.keyterms)
+        separator = "&" if "?" in self.endpoint else "?"
+        return f"{self.endpoint}{separator}{urlencode(params)}"
+
+    async def _transcribe_async(
+        self,
+        pcm: bytes,
+        *,
+        token: str,
+        options: TranscriptionOptions,
+        duration: float,
+    ) -> dict[str, Any]:
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds, connect=30.0)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.ws_connect(
+                    self._url(options),
+                    headers={"Authorization": f"Bearer {token}"},
+                    max_msg_size=16 * 1024 * 1024,
+                ) as websocket:
+                    created = await websocket.receive_json(timeout=min(30.0, self.timeout_seconds))
+                    if (
+                        not isinstance(created, Mapping)
+                        or created.get("type") != "transcript.created"
+                    ):
+                        raise _GrokStreamingRetryableError(
+                            "xAI streaming STT did not send transcript.created"
+                        )
+                    bytes_per_frame = 16_000 * 2 * self.frame_milliseconds // 1000
+                    for offset in range(0, len(pcm), bytes_per_frame):
+                        await websocket.send_bytes(pcm[offset : offset + bytes_per_frame])
+                        if self.realtime_factor > 0:
+                            await asyncio.sleep(
+                                self.frame_milliseconds / 1000.0 / self.realtime_factor
+                            )
+                    await websocket.send_json({"type": "audio.done"})
+                    events: list[Mapping[str, Any]] = []
+                    while True:
+                        message = await websocket.receive(timeout=self.timeout_seconds)
+                        if message.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                event = json.loads(message.data)
+                            except json.JSONDecodeError as exc:
+                                raise _GrokStreamingRetryableError(
+                                    "xAI streaming STT sent invalid JSON"
+                                ) from exc
+                            if not isinstance(event, Mapping):
+                                continue
+                            event_type = event.get("type")
+                            if event_type == "error":
+                                detail = str(event.get("message", "unknown error"))[:500]
+                                raise _GrokStreamingRetryableError(
+                                    f"xAI streaming STT error: {detail}"
+                                )
+                            if event_type in {"transcript.partial", "transcript.done"}:
+                                events.append(event)
+                            if event_type == "transcript.done":
+                                break
+                        elif message.type in {
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.ERROR,
+                        }:
+                            raise _GrokStreamingRetryableError(
+                                "xAI streaming STT closed before transcript.done"
+                            )
+        except aiohttp.WSServerHandshakeError as exc:
+            if exc.status in {401, 403}:
+                raise _GrokStreamingAuthError(
+                    f"xAI streaming STT rejected the Grok CLI login (HTTP {exc.status})"
+                ) from exc
+            if exc.status in {408, 409, 425, 429, 500, 502, 503, 504}:
+                raise _GrokStreamingRetryableError(
+                    f"xAI streaming STT handshake returned HTTP {exc.status}"
+                ) from exc
+            raise RuntimeError(f"xAI streaming STT handshake returned HTTP {exc.status}") from exc
+        return streaming_events_to_response(
+            events,
+            duration=duration,
+            default_language=options.language,
+        )
+
+    def transcribe(
+        self,
+        source: AudioSource,
+        options: TranscriptionOptions,
+    ) -> dict[str, Any]:
+        pcm = _load_pcm16_mono(source)
+        duration = len(pcm) / (16_000 * 2)
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                token = self.auth.access_token(
+                    force_refresh=isinstance(last_error, _GrokStreamingAuthError)
+                )
+                return asyncio.run(
+                    self._transcribe_async(
+                        pcm,
+                        token=token,
+                        options=options,
+                        duration=duration,
+                    )
+                )
+            except _GrokStreamingAuthError as exc:
+                last_error = exc
+            except (
+                _GrokStreamingRetryableError,
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                OSError,
+            ) as exc:
+                last_error = exc
+            if attempt >= self.max_retries:
+                break
+            time.sleep(min(2**attempt, 30))
+        raise RuntimeError(
+            f"Grok subscription STT failed after {self.max_retries + 1} attempts: {last_error}"
+        ) from last_error
 
 
 class GrokSTTClient:

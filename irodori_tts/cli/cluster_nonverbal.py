@@ -76,6 +76,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--representatives-boundary", type=int, default=2)
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--max-sources", type=int, default=None)
+    parser.add_argument(
+        "--min-source-seconds",
+        type=float,
+        default=0.0,
+        help="Exclude cached sources whose duration is at or below this value.",
+    )
     parser.add_argument("--source-shard-index", type=int, default=0)
     parser.add_argument("--source-shard-count", type=int, default=1)
     parser.add_argument(
@@ -118,6 +124,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Representative counts cannot be negative")
     if args.max_sources is not None and args.max_sources <= 0:
         raise ValueError("--max-sources must be positive")
+    if args.min_source_seconds < 0:
+        raise ValueError("--min-source-seconds must be non-negative")
     if args.source_shard_count <= 0:
         raise ValueError("--source-shard-count must be positive")
     if not 0 <= args.source_shard_index < args.source_shard_count:
@@ -155,6 +163,7 @@ def main() -> None:
             random_state=args.random_state,
         ),
         max_sources=args.max_sources,
+        min_source_seconds=args.min_source_seconds,
         force_features=args.force_features,
         source_shard_index=args.source_shard_index,
         source_shard_count=args.source_shard_count,
