@@ -31,8 +31,8 @@ model:
 
 train:
   train_mode: rf
-  batch_size: 8
-  gradient_accumulation_steps: 1
+  batch_size: 1
+  gradient_accumulation_steps: 8
   gradient_checkpointing: true
   data_parallel: false
   num_workers: 2
