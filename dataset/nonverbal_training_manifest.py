@@ -806,19 +806,19 @@ uv run --no-sync irodori-prepare-manifest `
   --speaker-column speaker_id `
   --speaker-id-prefix grok-stt `
   --target-sample-rate 48000 `
-  --output-manifest data/manifests/nonverbal.jsonl `
-  --latent-dir data/latents/nonverbal `
+  --output-manifest dataset/data/manifests/nonverbal.jsonl `
+  --latent-dir dataset/data/latents/nonverbal `
   --device cuda
 ```
 
 次に、既存のspeech latentと非言語latentを検証し、モデルが直接読む最終
-`data/manifests/train.jsonl` を生成します。入力マニフェストは上書きされません。
+`dataset/data/manifests/train.jsonl` を生成します。入力マニフェストは上書きされません。
 
 ```powershell
 uv run --no-sync python -m dataset.cli.merge_latent_manifests `
-  --input data/manifests/grok_stt.jsonl `
-  --input data/manifests/nonverbal.jsonl `
-  --output data/manifests/train.jsonl
+  --input dataset/data/manifests/grok_stt.jsonl `
+  --input dataset/data/manifests/nonverbal.jsonl `
+  --output dataset/data/manifests/train.jsonl
 ```
 
 入力行の `speaker_id` は変更しません。speechマニフェストと同じ

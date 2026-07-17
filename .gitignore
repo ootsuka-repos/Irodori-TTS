@@ -215,11 +215,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-gradio_outputs/
-gradio_outputs_voicedesign/
+# Runtime artifacts: all generated outputs live under outputs/, all dataset
+# intermediates (manifests, latents, source/training audio) under dataset/data/.
 outputs/
-data/
-
-# Local source/training audio. Keep only its workflow documentation in Git.
-grok_data/**
-!grok_data/README.md
+dataset/data/

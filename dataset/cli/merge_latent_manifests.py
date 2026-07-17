@@ -12,10 +12,10 @@ from dataset.nonverbal_training_manifest import (
 )
 
 DEFAULT_INPUT_MANIFESTS = (
-    Path("data/manifests/grok_stt.jsonl"),
-    Path("data/manifests/nonverbal.jsonl"),
+    Path("dataset/data/manifests/grok_stt.jsonl"),
+    Path("dataset/data/manifests/nonverbal.jsonl"),
 )
-DEFAULT_OUTPUT_MANIFEST = Path("data/manifests/train.jsonl")
+DEFAULT_OUTPUT_MANIFEST = Path("dataset/data/manifests/train.jsonl")
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -32,7 +32,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         help=(
             "Input latent manifest; repeat in any order. Defaults to "
-            "data/manifests/grok_stt.jsonl and data/manifests/nonverbal.jsonl."
+            "dataset/data/manifests/grok_stt.jsonl and dataset/data/manifests/nonverbal.jsonl."
         ),
     )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_MANIFEST)

@@ -21,26 +21,26 @@ def _parse_args() -> argparse.Namespace:
             "Microsoft BEATs, and export HDBSCAN/KMeans review clusters."
         )
     )
-    parser.add_argument("--data-root", type=Path, default=Path("data"))
+    parser.add_argument("--data-root", type=Path, default=Path("dataset/data"))
     parser.add_argument(
         "--raw-response-dir",
         type=Path,
-        default=Path("data/grok_stt/raw_responses"),
+        default=Path("dataset/data/grok_stt/raw_responses"),
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("data/grok_stt/nonverbal_clustering"),
+        default=Path("dataset/data/grok_stt/nonverbal_clustering"),
     )
     parser.add_argument(
         "--beats-code-dir",
         type=Path,
-        default=Path("data/grok_stt/_models/beats/code"),
+        default=Path("dataset/data/grok_stt/_models/beats/code"),
     )
     parser.add_argument(
         "--beats-checkpoint",
         type=Path,
-        default=Path("data/grok_stt/_models/beats/BEATs_iter3_plus_AS2M.pt"),
+        default=Path("dataset/data/grok_stt/_models/beats/BEATs_iter3_plus_AS2M.pt"),
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=32)

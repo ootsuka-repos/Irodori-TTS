@@ -14,9 +14,9 @@ from dataset.nonverbal_training_manifest import (
     write_nonverbal_training_manifests,
 )
 
-DEFAULT_DATASET_ROOT = Path("data/grok_stt/nonverbal_events/dataset")
+DEFAULT_DATASET_ROOT = Path("dataset/data/grok_stt/nonverbal_events/dataset")
 DEFAULT_EVENTS_MANIFEST = DEFAULT_DATASET_ROOT / "manifests/events.jsonl"
-DEFAULT_SPEECH_MANIFEST = Path("data/grok_stt/train.jsonl")
+DEFAULT_SPEECH_MANIFEST = Path("dataset/data/grok_stt/train.jsonl")
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

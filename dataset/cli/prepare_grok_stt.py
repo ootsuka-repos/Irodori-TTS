@@ -49,8 +49,8 @@ def _parse_args() -> argparse.Namespace:
             "timestamp-aligned FLAC clips and JSONL manifests for Irodori-TTS."
         )
     )
-    parser.add_argument("--input-dir", type=Path, default=Path("data"))
-    parser.add_argument("--output-dir", type=Path, default=Path("data/grok_stt"))
+    parser.add_argument("--input-dir", type=Path, default=Path("dataset/data"))
+    parser.add_argument("--output-dir", type=Path, default=Path("dataset/data/grok_stt"))
     parser.add_argument(
         "--dry-run",
         action="store_true",

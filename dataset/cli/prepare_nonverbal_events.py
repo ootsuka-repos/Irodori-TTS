@@ -49,26 +49,26 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--feature-dir",
         type=Path,
-        default=Path("data/grok_stt/nonverbal_events"),
+        default=Path("dataset/data/grok_stt/nonverbal_events"),
         help="Root containing embeddings/shards/*.jsonl and matching *.npy files.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("data/grok_stt/nonverbal_events"),
+        default=Path("dataset/data/grok_stt/nonverbal_events"),
         help="Pipeline work root; the atomic result is published under dataset/.",
     )
-    parser.add_argument("--data-root", type=Path, default=Path("data"))
+    parser.add_argument("--data-root", type=Path, default=Path("dataset/data"))
     parser.add_argument(
         "--manual-seeds",
         type=Path,
-        default=Path("data/grok_stt/manual_nonverbal_seeds.jsonl"),
+        default=Path("dataset/data/grok_stt/manual_nonverbal_seeds.jsonl"),
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--hf-cache-dir",
         type=Path,
-        default=Path("data/grok_stt/_models/hf"),
+        default=Path("dataset/data/grok_stt/_models/hf"),
     )
     parser.add_argument(
         "--allow-model-download",

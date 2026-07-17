@@ -838,18 +838,18 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "contextual Codex/Claude correction, DACVAE latents, and atomic publication."
         )
     )
-    parser.add_argument("--data-root", type=Path, default=Path("data"))
-    parser.add_argument("--work-dir", type=Path, default=Path("data/grok_stt"))
+    parser.add_argument("--data-root", type=Path, default=Path("dataset/data"))
+    parser.add_argument("--work-dir", type=Path, default=Path("dataset/data/grok_stt"))
     parser.add_argument(
-        "--nonverbal-dir", type=Path, default=Path("data/grok_stt/nonverbal_events_new")
+        "--nonverbal-dir", type=Path, default=Path("dataset/data/grok_stt/nonverbal_events_new")
     )
     parser.add_argument(
         "--nonverbal-training-dir",
         type=Path,
-        default=Path("data/grok_stt/nonverbal_training_all"),
+        default=Path("dataset/data/grok_stt/nonverbal_training_all"),
     )
-    parser.add_argument("--manifest-dir", type=Path, default=Path("data/manifests"))
-    parser.add_argument("--latent-root", type=Path, default=Path("data/latents/full_pipeline"))
+    parser.add_argument("--manifest-dir", type=Path, default=Path("dataset/data/manifests"))
+    parser.add_argument("--latent-root", type=Path, default=Path("dataset/data/latents/full_pipeline"))
     parser.add_argument(
         "--stt-auth-mode",
         choices=("subscription", "api-key"),

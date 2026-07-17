@@ -890,7 +890,7 @@ def main() -> None:
         default=None,
         help=(
             "Optional data_files for load_dataset. "
-            "Accepts paths/globs or split-qualified entries like train=data/train.jsonl."
+            "Accepts paths/globs or split-qualified entries like train=dataset/data/train.jsonl."
         ),
     )
     parser.add_argument("--audio-column", required=True, help="Audio column name")

@@ -52,29 +52,29 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "context windows. Codex, Claude, then Grok CLI are tried by default."
         )
     )
-    parser.add_argument("--speech-all", type=Path, default=Path("data/grok_stt/all.jsonl"))
+    parser.add_argument("--speech-all", type=Path, default=Path("dataset/data/grok_stt/all.jsonl"))
     parser.add_argument(
         "--speech-output-dir",
         type=Path,
-        default=Path("data/grok_stt"),
+        default=Path("dataset/data/grok_stt"),
         help="Atomically rewrites all/train/review JSONL under this directory.",
     )
     parser.add_argument(
         "--nonverbal-input",
         type=Path,
         default=Path(
-            "data/grok_stt/nonverbal_events_new/dataset/manifests/events_transcribed.jsonl"
+            "dataset/data/grok_stt/nonverbal_events_new/dataset/manifests/events_transcribed.jsonl"
         ),
     )
     parser.add_argument(
         "--nonverbal-output",
         type=Path,
-        default=Path("data/grok_stt/nonverbal_events_new/dataset/manifests/events_corrected.jsonl"),
+        default=Path("dataset/data/grok_stt/nonverbal_events_new/dataset/manifests/events_corrected.jsonl"),
     )
     parser.add_argument(
         "--cache-dir",
         type=Path,
-        default=Path("data/grok_stt/text_correction"),
+        default=Path("dataset/data/grok_stt/text_correction"),
     )
     parser.add_argument(
         "--agent-priority",

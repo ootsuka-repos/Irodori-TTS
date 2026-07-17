@@ -25,7 +25,7 @@ from dataset.local_asr import (
 )
 
 DEFAULT_OUTPUT_MANIFEST = Path(
-    "data/grok_stt/nonverbal_events_new/dataset/manifests/events_transcribed.jsonl"
+    "dataset/data/grok_stt/nonverbal_events_new/dataset/manifests/events_transcribed.jsonl"
 )
 
 
@@ -55,7 +55,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--input-manifest",
         type=Path,
-        default=Path("data/grok_stt/nonverbal_events_new/dataset/manifests/events.jsonl"),
+        default=Path("dataset/data/grok_stt/nonverbal_events_new/dataset/manifests/events.jsonl"),
     )
     parser.add_argument(
         "--output-manifest",
@@ -70,12 +70,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--audio-root",
         type=Path,
-        default=Path("data/grok_stt/nonverbal_events_new/dataset"),
+        default=Path("dataset/data/grok_stt/nonverbal_events_new/dataset"),
     )
     parser.add_argument(
         "--cache-dir",
         type=Path,
-        default=Path("data/grok_stt/nonverbal_events_new/anime_whisper_cache"),
+        default=Path("dataset/data/grok_stt/nonverbal_events_new/anime_whisper_cache"),
     )
     parser.add_argument("--model", default=ANIME_WHISPER_MODEL)
     parser.add_argument("--revision", default=ANIME_WHISPER_REVISION)

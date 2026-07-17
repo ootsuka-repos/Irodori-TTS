@@ -2034,8 +2034,8 @@ uv run --no-sync irodori-prepare-manifest `
   --speaker-column speaker_id `
   --speaker-id-prefix grok-stt `
   --target-sample-rate 48000 `
-  --output-manifest data/manifests/grok_stt.jsonl `
-  --latent-dir data/latents/grok_stt `
+  --output-manifest dataset/data/manifests/grok_stt.jsonl `
+  --latent-dir dataset/data/latents/grok_stt `
   --device cuda `
   --num-gpus 2 `
   --merge-output `
