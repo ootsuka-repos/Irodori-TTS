@@ -10,9 +10,9 @@ import numpy as np
 import pytest
 import torch
 
-from irodori_tts.cli.prepare_all import _parse_args as parse_full_pipeline_args
-from irodori_tts.cli.prepare_grok_stt import _run_pipelined_vad_stt
-from irodori_tts.data_prep.grok_stt import (
+from dataset.cli.prepare_all import _parse_args as parse_full_pipeline_args
+from dataset.cli.prepare_grok_stt import _run_pipelined_vad_stt
+from dataset.grok_stt import (
     AudioSource,
     GrokSubscriptionAuth,
     SileroVADConfig,
@@ -21,16 +21,16 @@ from irodori_tts.data_prep.grok_stt import (
     prepare_vad_plan,
     streaming_events_to_response,
 )
-from irodori_tts.data_prep.local_asr import transcribe_manifest_rows
-from irodori_tts.data_prep.nonverbal_clustering import (
+from dataset.local_asr import transcribe_manifest_rows
+from dataset.nonverbal_clustering import (
     BEATS_MIN_INPUT_SAMPLES,
     FeatureConfig,
     _pool_beats_batch,
     load_vad_complements,
 )
-from irodori_tts.data_prep.nonverbal_event_pipeline import load_feature_shards
-from irodori_tts.data_prep.nonverbal_training_manifest import render_nonverbal_text
-from irodori_tts.data_prep.transcript_correction import (
+from dataset.nonverbal_event_pipeline import load_feature_shards
+from dataset.nonverbal_training_manifest import render_nonverbal_text
+from dataset.transcript_correction import (
     CorrectionConfig,
     correct_transcript_rows,
 )
@@ -135,7 +135,7 @@ def test_vad_plan_is_resumable(tmp_path: Path, monkeypatch: Any) -> None:
         calls += 1
         return [(1.0, 3.0), (3.2, 5.0)]
 
-    monkeypatch.setattr("irodori_tts.data_prep.grok_stt.detect_speech_regions", fake_detect)
+    monkeypatch.setattr("dataset.grok_stt.detect_speech_regions", fake_detect)
     config = SileroVADConfig(max_join_gap_s=0.5)
     first = prepare_vad_plan(
         source,
@@ -176,10 +176,10 @@ def test_gpu_vad_producer_overlaps_async_stt_consumers(tmp_path: Path, monkeypat
         events.append(f"stt-end:{source.source_id}")
         return tmp_path / f"{source.source_id}.json"
 
-    monkeypatch.setattr("irodori_tts.cli.prepare_grok_stt.load_silero_vad", fake_load)
-    monkeypatch.setattr("irodori_tts.cli.prepare_grok_stt.prepare_vad_plan", fake_prepare)
+    monkeypatch.setattr("dataset.cli.prepare_grok_stt.load_silero_vad", fake_load)
+    monkeypatch.setattr("dataset.cli.prepare_grok_stt.prepare_vad_plan", fake_prepare)
     monkeypatch.setattr(
-        "irodori_tts.cli.prepare_grok_stt._transcribe_prepared_vad_source",
+        "dataset.cli.prepare_grok_stt._transcribe_prepared_vad_source",
         fake_transcribe,
     )
     errors = asyncio.run(
@@ -392,7 +392,7 @@ def test_context_correction_mixes_backends_and_reuses_cache(
         return output, "codex", None, []
 
     monkeypatch.setattr(
-        "irodori_tts.data_prep.transcript_correction._call_agents",
+        "dataset.transcript_correction._call_agents",
         fake_call,
     )
     config = CorrectionConfig(

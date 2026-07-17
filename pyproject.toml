@@ -36,20 +36,20 @@ dependencies = [
 ]
 
 [project.scripts]
-irodori-train = "irodori_tts.cli.train:main"
-irodori-infer = "irodori_tts.cli.infer:main"
-irodori-prepare-manifest = "irodori_tts.cli.prepare_manifest:main"
-irodori-prepare-grok-stt = "irodori_tts.cli.prepare_grok_stt:main"
-irodori-prepare-anime-whisper = "irodori_tts.cli.prepare_anime_whisper:main"
-irodori-correct-transcripts = "irodori_tts.cli.correct_transcripts:main"
-irodori-prepare-all = "irodori_tts.cli.prepare_all:main"
-irodori-cluster-nonverbal = "irodori_tts.cli.cluster_nonverbal:main"
-irodori-prepare-nonverbal-events = "irodori_tts.cli.prepare_nonverbal_events:main"
-irodori-prepare-nonverbal-training = "irodori_tts.cli.prepare_nonverbal_training:main"
-irodori-merge-latent-manifests = "irodori_tts.cli.merge_latent_manifests:main"
-irodori-convert-checkpoint = "irodori_tts.cli.convert_checkpoint:main"
-irodori-web = "irodori_tts.apps.gradio:main"
-irodori-voice-design-web = "irodori_tts.apps.voice_design:main"
+irodori-train = "train.cli.train:main"
+irodori-infer = "inference.cli.infer:main"
+irodori-prepare-manifest = "dataset.cli.prepare_manifest:main"
+irodori-prepare-grok-stt = "dataset.cli.prepare_grok_stt:main"
+irodori-prepare-anime-whisper = "dataset.cli.prepare_anime_whisper:main"
+irodori-correct-transcripts = "dataset.cli.correct_transcripts:main"
+irodori-prepare-all = "dataset.cli.prepare_all:main"
+irodori-cluster-nonverbal = "dataset.cli.cluster_nonverbal:main"
+irodori-prepare-nonverbal-events = "dataset.cli.prepare_nonverbal_events:main"
+irodori-prepare-nonverbal-training = "dataset.cli.prepare_nonverbal_training:main"
+irodori-merge-latent-manifests = "dataset.cli.merge_latent_manifests:main"
+irodori-convert-checkpoint = "inference.cli.convert_checkpoint:main"
+irodori-web = "inference.apps.gradio:main"
+irodori-voice-design-web = "inference.apps.voice_design:main"
 
 [project.optional-dependencies]
 cpu = [
@@ -162,7 +162,7 @@ ignore = [
 "__init__.py" = ["F401"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["irodori_tts"]
+known-first-party = ["core", "train", "dataset", "inference"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -174,4 +174,5 @@ line-ending = "auto"
 testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
-include = ["irodori_tts*"]
+include = ["core*", "train*", "dataset*", "inference*"]
+exclude = ["train.configs*"]
