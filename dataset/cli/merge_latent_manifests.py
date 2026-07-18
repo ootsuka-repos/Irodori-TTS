@@ -7,9 +7,7 @@ import argparse
 from collections.abc import Sequence
 from pathlib import Path
 
-from dataset.nonverbal_training_manifest import (
-    merge_latent_training_manifests,
-)
+from dataset.manifest_merge import merge_latent_training_manifests
 
 DEFAULT_INPUT_MANIFESTS = (
     Path("dataset/data/manifests/speech.jsonl"),

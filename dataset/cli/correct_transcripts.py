@@ -62,14 +62,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--nonverbal-input",
         type=Path,
-        default=Path(
-            "dataset/data/pipeline/nonverbal_events_new/dataset/manifests/events_transcribed.jsonl"
-        ),
+        default=None,
+        help="Optional separate nonverbal stream; omit when nonverbal rows are already in --speech-all.",
     )
     parser.add_argument(
         "--nonverbal-output",
         type=Path,
-        default=Path("dataset/data/pipeline/nonverbal_events_new/dataset/manifests/events_corrected.jsonl"),
+        default=None,
     )
     parser.add_argument(
         "--cache-dir",
@@ -108,7 +107,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
     args = _parse_args(argv)
     speech_rows = _read_jsonl(args.speech_all.expanduser().resolve())
-    nonverbal_rows = _read_jsonl(args.nonverbal_input.expanduser().resolve())
+    nonverbal_rows: list[dict[str, Any]] = []
+    if args.nonverbal_input is not None:
+        if args.nonverbal_output is None:
+            raise SystemExit("--nonverbal-output is required when --nonverbal-input is given")
+        nonverbal_rows = _read_jsonl(args.nonverbal_input.expanduser().resolve())
     config = CorrectionConfig(
         agent_priority=tuple(args.agent_priority),
         target_batch_size=args.target_batch_size,
@@ -140,7 +143,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     speech_dir = args.speech_output_dir.expanduser().resolve()
     speech.sort(key=lambda row: (str(row.get("source_uid", "")), float(row.get("start", 0))))
-    _atomic_write_jsonl(speech_dir / "all.jsonl", speech)
+    # The corrected stream gets its own name so the segmentation stage's
+    # all.jsonl (this stage's upstream input) is never clobbered.
+    _atomic_write_jsonl(speech_dir / "all_corrected.jsonl", speech)
     _atomic_write_jsonl(
         speech_dir / "train.jsonl",
         [row for row in speech if row.get("status") == "train"],
@@ -149,8 +154,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         speech_dir / "review.jsonl",
         [row for row in speech if row.get("status") == "review"],
     )
-    nonverbal_path = args.nonverbal_output.expanduser().resolve()
-    _atomic_write_jsonl(nonverbal_path, nonverbal)
+    nonverbal_path = None
+    if args.nonverbal_output is not None:
+        nonverbal_path = args.nonverbal_output.expanduser().resolve()
+        _atomic_write_jsonl(nonverbal_path, nonverbal)
     summary_path = args.cache_dir.expanduser().resolve() / "last_summary.json"
     _atomic_write_json(summary_path, summary)
     _atomic_write_jsonl(

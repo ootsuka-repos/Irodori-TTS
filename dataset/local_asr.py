@@ -160,12 +160,17 @@ class FasterWhisperConfig:
     log_prob_threshold: float = -1.0
     no_speech_threshold: float = 0.6
     condition_on_previous_text: bool = False
+    # Cross-clip batching: clips are at most ~20.5 s, i.e. exactly one Whisper
+    # 30 s window each, so several clips can share one batched generate() call.
+    batch_size: int = 8
 
     def __post_init__(self) -> None:
         if self.beam_size <= 0:
             raise ValueError("beam_size must be positive")
         if self.repetition_penalty < 1.0:
             raise ValueError("repetition_penalty must be >= 1.0")
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be positive")
 
 
 class FasterWhisperTranscriber:
@@ -186,6 +191,7 @@ class FasterWhisperTranscriber:
             "beam_size": self.config.beam_size,
             "repetition_penalty": self.config.repetition_penalty,
             "condition_on_previous_text": self.config.condition_on_previous_text,
+            "batch_size": self.config.batch_size,
             "audio_uploaded": False,
         }
 
@@ -214,6 +220,8 @@ class FasterWhisperTranscriber:
     def transcribe(self, audio_paths: Sequence[Path]) -> list[str]:
         if not audio_paths:
             return []
+        if self.config.batch_size > 1:
+            return self._transcribe_batched(audio_paths)
         model = self._load()
         results: list[str] = []
         for path in audio_paths:
@@ -230,6 +238,56 @@ class FasterWhisperTranscriber:
             )
             text = "".join(segment.text for segment in segments)
             results.append(normalize_transcript(text))
+        return results
+
+    def _transcribe_batched(self, audio_paths: Sequence[Path]) -> list[str]:
+        """True cross-clip batching through the CTranslate2 Whisper API.
+
+        Every training clip fits one 30 s Whisper window, so each clip is one
+        batch element; the per-file fallback loops (temperature/compression
+        retries) are traded for throughput — repetition_penalty plus beam
+        search handles the repetition failure mode this corpus actually has.
+        """
+        import numpy as np
+        from faster_whisper.audio import decode_audio
+        from faster_whisper.tokenizer import Tokenizer
+
+        model = self._load()
+        extractor = model.feature_extractor
+        tokenizer = Tokenizer(
+            model.hf_tokenizer,
+            True,
+            task="transcribe",
+            language=self.config.language,
+        )
+        prompt = model.get_prompt(tokenizer, [], without_timestamps=True)
+
+        results: list[str] = []
+        batch_size = self.config.batch_size
+        for offset in range(0, len(audio_paths), batch_size):
+            batch = audio_paths[offset : offset + batch_size]
+            features = []
+            for path in batch:
+                audio = decode_audio(str(path), sampling_rate=extractor.sampling_rate)
+                if audio.shape[0] < extractor.n_samples:
+                    audio = np.pad(audio, (0, extractor.n_samples - audio.shape[0]))
+                else:
+                    audio = audio[: extractor.n_samples]
+                features.append(extractor(audio, padding=0)[:, : extractor.nb_max_frames])
+            encoder_output = model.encode(np.stack(features).astype(np.float32))
+            generation = model.model.generate(
+                encoder_output,
+                [prompt] * len(batch),
+                beam_size=self.config.beam_size,
+                repetition_penalty=self.config.repetition_penalty,
+                no_repeat_ngram_size=0,
+                max_length=448,
+                return_scores=False,
+                suppress_blank=True,
+            )
+            for result in generation:
+                text = tokenizer.decode(result.sequences_ids[0])
+                results.append(normalize_transcript(text))
         return results
 
 

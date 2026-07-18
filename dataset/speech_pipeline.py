@@ -626,98 +626,82 @@ def review_reasons(
     return reasons
 
 
-def build_dataset(
-    sources: Sequence[AudioSource],
-    output_dir: Path,
+def _process_one_source(
+    source: AudioSource,
     *,
+    output_dir: Path,
     vad_config: SileroVADConfig,
     segmentation_config: SpeechSegmentationConfig,
     project_root: Path,
-    vad_device: str = "cpu",
-    rebuild_clips: bool = False,
-) -> dict[str, Any]:
-    """Run VAD, cut 5-20 s FLAC clips, and write all/train/review manifests.
+    rebuild_clips: bool,
+    vad_model: Any,
+    get_speech_timestamps: Callable[..., Any] | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """VAD + clip extraction for one source; returns (source_row, rows, errors)."""
+    source_row = source.metadata()
+    rows: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
 
-    Manifest rows start with an empty ``text``; the anime-whisper stage is the
-    single source of transcripts.
-    """
-    output_dir = output_dir.expanduser().resolve()
-    segmentation_config.validate()
-    model: Any = None
-    get_speech_timestamps: Callable[..., Any] | None = None
-
-    all_rows: list[dict[str, Any]] = []
-    source_rows: list[dict[str, Any]] = []
-    source_errors: list[dict[str, Any]] = []
-
-    for index, source in enumerate(sources, 1):
-        source_row = source.metadata()
-        regions = load_cached_vad(output_dir, source, config=vad_config)
-        if regions is None:
-            if model is None:
-                model, get_speech_timestamps = load_silero_vad(
-                    vad_config.repo, device=vad_device
-                )
-            try:
-                regions = detect_speech_regions(
-                    source,
-                    config=vad_config,
-                    model=model,
-                    get_speech_timestamps=get_speech_timestamps,
-                )
-            except (OSError, RuntimeError, ValueError) as exc:
-                source_row["status"] = "error"
-                source_row["reason"] = "vad_error"
-                source_rows.append(source_row)
-                source_errors.append(
-                    {
-                        "source_uid": source.source_id,
-                        "source_audio": _manifest_path(source.path, project_root),
-                        "reason": "vad_error",
-                        "error": str(exc),
-                    }
-                )
-                continue
-            save_cached_vad(output_dir, source, regions, config=vad_config)
-
-        segments = segment_vad_regions(
-            regions,
-            source_duration=source.duration,
-            config=segmentation_config,
-        )
-        written_for_source = 0
+    regions = load_cached_vad(output_dir, source, config=vad_config)
+    if regions is None:
         try:
-            with sf.SoundFile(source.path) as reader:
-                segments = extend_segment_tails(reader, segments, segmentation_config)
-                for segment in segments:
-                    start_ms = round(segment.start * 1000)
-                    end_ms = round(segment.end * 1000)
-                    clip_id = f"{source.source_id}_{start_ms:010d}_{end_ms:010d}"
-                    clip_path = output_dir / "clips" / source.source_id / f"{clip_id}.flac"
-                    try:
-                        stats = extract_clip(
-                            reader,
-                            clip_path,
-                            start=segment.start,
-                            end=segment.end,
-                            rebuild=rebuild_clips,
-                            tail_pad_seconds=segmentation_config.tail_pad_silence_seconds,
-                        )
-                    except (OSError, RuntimeError, ValueError) as exc:
-                        source_errors.append(
-                            {
-                                "source_uid": source.source_id,
-                                "segment_id": clip_id,
-                                "reason": "clip_extract_error",
-                                "error": str(exc),
-                            }
-                        )
-                        continue
+            regions = detect_speech_regions(
+                source,
+                config=vad_config,
+                model=vad_model,
+                get_speech_timestamps=get_speech_timestamps,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            source_row["status"] = "error"
+            source_row["reason"] = "vad_error"
+            errors.append(
+                {
+                    "source_uid": source.source_id,
+                    "source_audio": _manifest_path(source.path, project_root),
+                    "reason": "vad_error",
+                    "error": str(exc),
+                }
+            )
+            return source_row, rows, errors
+        save_cached_vad(output_dir, source, regions, config=vad_config)
 
-                    reasons = review_reasons(
-                        segment, segmentation_config, audio_stats=stats
+    segments = segment_vad_regions(
+        regions,
+        source_duration=source.duration,
+        config=segmentation_config,
+    )
+    written_for_source = 0
+    try:
+        with sf.SoundFile(source.path) as reader:
+            segments = extend_segment_tails(reader, segments, segmentation_config)
+            for segment in segments:
+                start_ms = round(segment.start * 1000)
+                end_ms = round(segment.end * 1000)
+                clip_id = f"{source.source_id}_{start_ms:010d}_{end_ms:010d}"
+                clip_path = output_dir / "clips" / source.source_id / f"{clip_id}.flac"
+                try:
+                    stats = extract_clip(
+                        reader,
+                        clip_path,
+                        start=segment.start,
+                        end=segment.end,
+                        rebuild=rebuild_clips,
+                        tail_pad_seconds=segmentation_config.tail_pad_silence_seconds,
                     )
-                    row: dict[str, Any] = {
+                except (OSError, RuntimeError, ValueError) as exc:
+                    errors.append(
+                        {
+                            "source_uid": source.source_id,
+                            "segment_id": clip_id,
+                            "reason": "clip_extract_error",
+                            "error": str(exc),
+                        }
+                    )
+                    continue
+
+                reasons = review_reasons(segment, segmentation_config, audio_stats=stats)
+                rows.append(
+                    {
                         "id": clip_id,
                         "audio": _manifest_path(clip_path, project_root),
                         "text": "",
@@ -735,36 +719,160 @@ def build_dataset(
                         "rms": round(stats.rms, 7),
                         "clipping_ratio": round(stats.clipping_ratio, 9),
                     }
-                    all_rows.append(row)
-                    written_for_source += 1
-        except (OSError, RuntimeError) as exc:
-            source_errors.append(
-                {
-                    "source_uid": source.source_id,
-                    "source_audio": _manifest_path(source.path, project_root),
-                    "reason": "source_decode_error",
-                    "error": str(exc),
-                }
-            )
+                )
+                written_for_source += 1
+    except (OSError, RuntimeError) as exc:
+        errors.append(
+            {
+                "source_uid": source.source_id,
+                "source_audio": _manifest_path(source.path, project_root),
+                "reason": "source_decode_error",
+                "error": str(exc),
+            }
+        )
 
-        source_row["status"] = "processed" if written_for_source else "review"
-        source_row["segments"] = written_for_source
+    source_row["status"] = "processed" if written_for_source else "review"
+    source_row["segments"] = written_for_source
+    return source_row, rows, errors
+
+
+_POOL_STATE: dict[str, Any] = {}
+
+
+def _pool_init(
+    output_dir: str,
+    vad_config: SileroVADConfig,
+    segmentation_config: SpeechSegmentationConfig,
+    project_root: str,
+    vad_devices: tuple[str, ...],
+    rebuild_clips: bool,
+) -> None:
+    import os
+
+    _POOL_STATE.update(
+        output_dir=Path(output_dir),
+        vad_config=vad_config,
+        segmentation_config=segmentation_config,
+        project_root=Path(project_root),
+        vad_device=vad_devices[os.getpid() % len(vad_devices)],
+        rebuild_clips=rebuild_clips,
+        model=None,
+        get_speech_timestamps=None,
+    )
+
+
+def _pool_process(source: AudioSource) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    state = _POOL_STATE
+    if state["model"] is None:
+        # Lazy per-worker Silero load; cached sources never pay for it.
+        needs_vad = (
+            load_cached_vad(state["output_dir"], source, config=state["vad_config"]) is None
+        )
+        if needs_vad:
+            state["model"], state["get_speech_timestamps"] = load_silero_vad(
+                state["vad_config"].repo, device=state["vad_device"]
+            )
+    return _process_one_source(
+        source,
+        output_dir=state["output_dir"],
+        vad_config=state["vad_config"],
+        segmentation_config=state["segmentation_config"],
+        project_root=state["project_root"],
+        rebuild_clips=state["rebuild_clips"],
+        vad_model=state["model"],
+        get_speech_timestamps=state["get_speech_timestamps"],
+    )
+
+
+def build_dataset(
+    sources: Sequence[AudioSource],
+    output_dir: Path,
+    *,
+    vad_config: SileroVADConfig,
+    segmentation_config: SpeechSegmentationConfig,
+    project_root: Path,
+    vad_device: str = "cpu",
+    vad_devices: Sequence[str] | None = None,
+    workers: int = 1,
+    rebuild_clips: bool = False,
+    manifest_suffix: str = "",
+) -> dict[str, Any]:
+    """Run VAD, cut 5-20 s FLAC clips, and write all/train/review manifests.
+
+    ``workers > 1`` uses a dynamic process pool: every worker pulls the next
+    source as soon as it finishes, so uneven source durations cannot leave a
+    long single-worker tail the way static sharding does. Manifest rows start
+    with an empty ``text``; the ASR stage is the single source of transcripts.
+    """
+    output_dir = output_dir.expanduser().resolve()
+    segmentation_config.validate()
+    devices = tuple(vad_devices) if vad_devices else (vad_device,)
+
+    all_rows: list[dict[str, Any]] = []
+    source_rows: list[dict[str, Any]] = []
+    source_errors: list[dict[str, Any]] = []
+
+    def consume(index: int, result: tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]) -> None:
+        source_row, rows, errors = result
         source_rows.append(source_row)
+        all_rows.extend(rows)
+        source_errors.extend(errors)
         print(
-            f"speech {index}/{len(sources)} source={source.source_id} "
-            f"segments={written_for_source}",
+            f"speech {index}/{len(sources)} source={source_row['source_id']} "
+            f"segments={source_row.get('segments', 0)}",
             flush=True,
         )
+
+    if workers <= 1:
+        model: Any = None
+        get_speech_timestamps: Callable[..., Any] | None = None
+        for index, source in enumerate(sources, 1):
+            if model is None and load_cached_vad(output_dir, source, config=vad_config) is None:
+                model, get_speech_timestamps = load_silero_vad(
+                    vad_config.repo, device=devices[0]
+                )
+            consume(
+                index,
+                _process_one_source(
+                    source,
+                    output_dir=output_dir,
+                    vad_config=vad_config,
+                    segmentation_config=segmentation_config,
+                    project_root=project_root,
+                    rebuild_clips=rebuild_clips,
+                    vad_model=model,
+                    get_speech_timestamps=get_speech_timestamps,
+                ),
+            )
+    else:
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_pool_init,
+            initargs=(
+                str(output_dir),
+                vad_config,
+                segmentation_config,
+                str(project_root),
+                devices,
+                rebuild_clips,
+            ),
+        ) as pool:
+            for index, result in enumerate(
+                pool.map(_pool_process, sources, chunksize=1), 1
+            ):
+                consume(index, result)
 
     all_rows.sort(key=lambda row: (str(row["source_uid"]), float(row["start"])))
     train_rows = [row for row in all_rows if row["status"] == "train"]
     review_rows = [row for row in all_rows if row["status"] == "review"]
-    atomic_write_jsonl(output_dir / "all.jsonl", all_rows)
-    atomic_write_jsonl(output_dir / "train.jsonl", train_rows)
-    atomic_write_jsonl(output_dir / "review.jsonl", review_rows)
-    atomic_write_jsonl(output_dir / "sources.jsonl", source_rows)
+    atomic_write_jsonl(output_dir / f"all{manifest_suffix}.jsonl", all_rows)
+    atomic_write_jsonl(output_dir / f"train{manifest_suffix}.jsonl", train_rows)
+    atomic_write_jsonl(output_dir / f"review{manifest_suffix}.jsonl", review_rows)
+    atomic_write_jsonl(output_dir / f"sources{manifest_suffix}.jsonl", source_rows)
     if source_errors:
-        atomic_write_jsonl(output_dir / "source_errors.jsonl", source_errors)
+        atomic_write_jsonl(output_dir / f"source_errors{manifest_suffix}.jsonl", source_errors)
 
     return {
         "sources": len(sources),

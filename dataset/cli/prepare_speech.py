@@ -30,6 +30,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-source-seconds", type=float, default=300.0)
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument("--vad-device", default="cpu")
+    parser.add_argument(
+        "--vad-devices",
+        default=None,
+        help="Comma-separated device list spread over pool workers (e.g. cuda:0,cuda:1).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Dynamic worker pool size; each worker pulls the next source when free.",
+    )
     parser.add_argument("--vad-threshold", type=float, default=None)
     parser.add_argument("--vad-speech-pad-ms", type=int, default=None)
     parser.add_argument("--min-seconds", type=float, default=None)
@@ -37,6 +48,21 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--join-gap-seconds", type=float, default=None)
     parser.add_argument("--padding-seconds", type=float, default=None)
     parser.add_argument("--rebuild-clips", action="store_true")
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=0,
+        help="Process only sources where source_index %% shard-count == shard-index.",
+    )
+    parser.add_argument(
+        "--shard-count",
+        type=int,
+        default=1,
+        help=(
+            "Total parallel shards (one process per GPU). Manifests are written "
+            "with a .shardN suffix and must be merged afterwards."
+        ),
+    )
     parser.add_argument(
         "--max-source-errors",
         type=int,
@@ -86,9 +112,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     sources = [source for source in sources if source.duration > args.min_source_seconds]
     if args.max_files is not None:
         sources = sources[: args.max_files]
+    if args.shard_count <= 0 or not 0 <= args.shard_index < args.shard_count:
+        raise SystemExit("--shard-index must be in [0, --shard-count)")
+    manifest_suffix = ""
+    if args.shard_count > 1:
+        sources = sources[args.shard_index :: args.shard_count]
+        manifest_suffix = f".shard{args.shard_index}"
     if not sources:
         raise SystemExit(f"No eligible source audio found under {args.input_dir}")
 
+    vad_devices = None
+    if args.vad_devices:
+        vad_devices = tuple(
+            item.strip() for item in str(args.vad_devices).split(",") if item.strip()
+        )
     summary = build_dataset(
         sources,
         args.output_dir,
@@ -96,7 +133,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         segmentation_config=segmentation_config,
         project_root=args.project_root.expanduser().resolve(),
         vad_device=args.vad_device,
+        vad_devices=vad_devices,
+        workers=args.workers,
         rebuild_clips=args.rebuild_clips,
+        manifest_suffix=manifest_suffix,
     )
     print(
         f"speech complete sources={summary['sources']} rows={summary['rows']} "

@@ -195,6 +195,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 device=device,
                 device_index=device_index,
                 language="ja",
+                batch_size=args.batch_size,
             )
         )
     else:

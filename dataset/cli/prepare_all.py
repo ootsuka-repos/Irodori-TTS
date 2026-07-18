@@ -29,19 +29,15 @@ from dataset.speech_pipeline import discover_audio_sources
 PIPELINE_SCHEMA_VERSION = 1
 STAGES = (
     "speech",
-    "nonverbal_features",
-    "nonverbal_classification",
+    "nonverbal",
     "anime_whisper",
     "context_correction",
-    "training_manifests",
     "latents",
     "publish",
 )
 # Stages that need CUDA; preflight only requires a GPU when one of these is in
-# the selected --start-at/--stop-after range.
-GPU_STAGES = frozenset(
-    {"speech", "nonverbal_features", "nonverbal_classification", "anime_whisper", "latents"}
-)
+# the selected --start-at/--stop-after range. The nonverbal stage is pure CPU.
+GPU_STAGES = frozenset({"speech", "anime_whisper", "latents"})
 # Everything that determines latent content. Part of the _latent_one cache key
 # and the latents stage fingerprint so changed encode settings invalidate
 # previously generated latents instead of silently reusing them.
@@ -132,8 +128,6 @@ class PipelineRunner:
         self.root = Path.cwd().resolve()
         self.data_root = args.data_root.expanduser().resolve()
         self.work_dir = args.work_dir.expanduser().resolve()
-        self.nonverbal_dir = args.nonverbal_dir.expanduser().resolve()
-        self.nonverbal_training_dir = args.nonverbal_training_dir.expanduser().resolve()
         self.manifest_dir = args.manifest_dir.expanduser().resolve()
         self.latent_root = args.latent_root.expanduser().resolve()
         self.state_path = self.work_dir / "full_pipeline" / "state.json"
@@ -281,8 +275,6 @@ class PipelineRunner:
         # excluded, or generated FLAC clips would be rediscovered as sources.
         excluded = (
             self.work_dir,
-            self.nonverbal_dir,
-            self.nonverbal_training_dir,
             self.manifest_dir,
             self.latent_root,
         )
@@ -313,14 +305,6 @@ class PipelineRunner:
             self._preflight_problem(
                 "Neither codex nor claude CLI is installed for transcript correction"
             )
-        if "nonverbal_features" in selected_stages:
-            beats_code = self.work_dir / "_models" / "beats" / "code"
-            beats_checkpoint = self.work_dir / "_models" / "beats" / "BEATs_iter3_plus_AS2M.pt"
-            if not beats_code.is_dir() or not beats_checkpoint.is_file():
-                self._preflight_problem(
-                    "Pinned BEATs files are missing: "
-                    f"code={beats_code}, checkpoint={beats_checkpoint}"
-                )
         gpu_display = "unused"
         if selected_stages & GPU_STAGES:
             try:
@@ -364,8 +348,6 @@ class PipelineRunner:
             str(self.root),
             "--min-source-seconds",
             str(self.args.min_source_seconds),
-            "--vad-device",
-            self.primary_device,
             "--vad-speech-pad-ms",
             str(self.args.audio_padding_ms),
             "--padding-seconds",
@@ -373,13 +355,7 @@ class PipelineRunner:
             "--max-source-errors",
             str(self.args.max_source_errors),
         ]
-        for directory in (
-            self.work_dir,
-            self.nonverbal_dir,
-            self.nonverbal_training_dir,
-            self.manifest_dir,
-            self.latent_root,
-        ):
+        for directory in (self.work_dir, self.manifest_dir, self.latent_root):
             command.extend(["--exclude-dir", str(directory)])
         if self.args.rebuild_clips:
             # Clips are content-addressed (id embeds start/end ms) and written
@@ -387,6 +363,18 @@ class PipelineRunner:
             command.append("--rebuild-clips")
         if self.args.max_files is not None:
             command.extend(["--max-files", str(self.args.max_files)])
+
+        # The speech stage is CPU-bound (decode/resample/FLAC). A dynamic
+        # in-process pool lets every worker pull the next source when free, so
+        # uneven source durations cannot leave a single-worker tail.
+        command.extend(
+            [
+                "--workers",
+                str(max(1, int(self.args.speech_shards))),
+                "--vad-devices",
+                ",".join(f"cuda:{index}" for index in self.gpu_indices),
+            ]
+        )
         self.run_stage(
             "speech",
             fingerprint=fingerprint,
@@ -394,83 +382,46 @@ class PipelineRunner:
             action=lambda: self.run_command("speech", command),
         )
 
-    def nonverbal_features(self) -> None:
+    def nonverbal(self) -> None:
+        """Cut VAD-complement event clips; ASR + LLM assign text and category."""
         raw_paths = sorted((self.work_dir / "vad_responses").glob("*.json"))
         fingerprint = _hash(
             {
-                "raw": [_path_record(path) for path in raw_paths],
-                "segmentation": "acoustic",
+                "vad": [_path_record(path) for path in raw_paths],
+                "segmentation": "acoustic-vad-complement-5-20s",
                 "min_source_seconds": self.args.min_source_seconds,
             }
         )
         command = [
             sys.executable,
             "-m",
-            "dataset.cli.cluster_nonverbal",
-            "--data-root",
+            "dataset.cli.prepare_nonverbal",
+            "--input-dir",
             str(self.data_root),
-            "--raw-response-dir",
-            str(self.work_dir / "vad_responses"),
             "--output-dir",
-            str(self.nonverbal_dir),
-            "--beats-code-dir",
-            str(self.work_dir / "_models" / "beats" / "code"),
-            "--beats-checkpoint",
-            str(self.work_dir / "_models" / "beats" / "BEATs_iter3_plus_AS2M.pt"),
-            "--device",
-            self.primary_device,
-            "--batch-size",
-            str(self.args.beats_batch_size),
+            str(self.work_dir),
+            "--project-root",
+            str(self.root),
             "--min-source-seconds",
             str(self.args.min_source_seconds),
-            "--segmentation-mode",
-            "acoustic",
+            "--workers",
+            str(max(1, int(self.args.speech_shards))),
+            "--vad-speech-pad-ms",
+            str(self.args.audio_padding_ms),
+            "--max-source-errors",
+            str(self.args.max_source_errors),
         ]
+        for directory in (self.work_dir, self.manifest_dir, self.latent_root):
+            command.extend(["--exclude-dir", str(directory)])
+        if self.args.rebuild_clips:
+            command.append("--rebuild-clips")
         if self.args.max_files is not None:
-            command.extend(["--max-sources", str(self.args.max_files)])
+            command.extend(["--max-files", str(self.args.max_files)])
         self.run_stage(
-            "nonverbal_features",
+            "nonverbal",
             fingerprint=fingerprint,
-            outputs=(self.nonverbal_dir / "candidates.jsonl", self.nonverbal_dir / "embeddings"),
-            action=lambda: self.run_command("nonverbal_features", command),
-        )
-
-    def nonverbal_classification(self) -> None:
-        candidates = self.nonverbal_dir / "candidates.jsonl"
-        fingerprint = _hash(
-            {
-                "candidates": _path_record(candidates),
-                "padding": self.args.audio_padding_seconds,
-                "classifier_batch": self.args.classifier_batch_size,
-            }
-        )
-        command = [
-            sys.executable,
-            "-m",
-            "dataset.cli.prepare_nonverbal_events",
-            "--feature-dir",
-            str(self.nonverbal_dir),
-            "--output-dir",
-            str(self.nonverbal_dir),
-            "--data-root",
-            str(self.data_root),
-            "--device",
-            self.primary_device,
-            "--hf-cache-dir",
-            str(self.work_dir / "_models" / "hf"),
-            "--classifier-batch-size",
-            str(self.args.classifier_batch_size),
-            "--final-clip-padding-seconds",
-            str(self.args.audio_padding_seconds),
-        ]
-        if self.args.allow_model_download:
-            command.append("--allow-model-download")
-        events = self.nonverbal_dir / "dataset" / "manifests" / "events.jsonl"
-        self.run_stage(
-            "nonverbal_classification",
-            fingerprint=fingerprint,
-            outputs=(events, self.nonverbal_dir / "dataset" / "summary.json"),
-            action=lambda: self.run_command("nonverbal_classification", command),
+            outputs=(self.work_dir / "nonverbal_events.jsonl",),
+            action=lambda: self.run_command("nonverbal", command),
         )
 
     def _merge_transcription_shards(
@@ -528,13 +479,15 @@ class PipelineRunner:
         if replace_text:
             base.append("--replace-text")
         gpus = self.gpu_indices
-        if len(gpus) == 1:
+        worker_count = len(gpus) * max(1, int(self.args.asr_workers_per_gpu))
+        if worker_count == 1:
             command = [*base, "--device", f"cuda:{gpus[0]}", "--output-manifest", str(output_manifest)]
             self.run_command(f"anime_whisper_{label}", command)
             return
         shard_paths: list[Path] = []
         jobs: list[tuple[str, list[str]]] = []
-        for shard_index, gpu in enumerate(gpus):
+        for shard_index in range(worker_count):
+            gpu = gpus[shard_index % len(gpus)]
             shard_path = output_manifest.with_name(f"{output_manifest.name}.shard{shard_index}")
             shard_paths.append(shard_path)
             jobs.append(
@@ -549,7 +502,7 @@ class PipelineRunner:
                         "--shard-index",
                         str(shard_index),
                         "--shard-count",
-                        str(len(gpus)),
+                        str(worker_count),
                     ],
                 )
             )
@@ -562,58 +515,56 @@ class PipelineRunner:
             shard.unlink(missing_ok=True)
 
     def anime_whisper(self) -> None:
-        dataset = self.nonverbal_dir / "dataset"
-        source = dataset / "manifests" / "events.jsonl"
-        output = dataset / "manifests" / "events_transcribed.jsonl"
         speech_source = self.work_dir / "all.jsonl"
-        speech_output = self.work_dir / "all_aw.jsonl"
+        nonverbal_source = self.work_dir / "nonverbal_events.jsonl"
+        combined = self.work_dir / "all_clips.jsonl"
+        output = self.work_dir / "all_aw.jsonl"
         fingerprint = _hash(
             {
-                "events": _path_record(source),
                 "speech": _path_record(speech_source),
+                "nonverbal": _path_record(nonverbal_source),
                 "backend": "faster-whisper",
                 "model": "TransWithAI/whisper-ja-1.5B-ct2",
-                "speech_replace_text": True,
+                "replace_text": True,
             }
         )
 
         def action() -> None:
+            # One unified clip stream: speech and nonverbal rows share the same
+            # shape, ASR backend, and (later) LLM classification.
+            temporary = combined.with_name(f".{combined.name}.tmp")
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                for source in (speech_source, nonverbal_source):
+                    with source.open("r", encoding="utf-8-sig") as reader:
+                        for line in reader:
+                            if line.strip():
+                                handle.write(line.rstrip("\n") + "\n")
+            os.replace(temporary, combined)
             self._transcribe_parallel(
-                "nonverbal",
-                input_manifest=source,
+                "clips",
+                input_manifest=combined,
                 output_manifest=output,
-                audio_root=dataset,
-                cache_dir=self.nonverbal_dir / "anime_whisper_cache",
-                replace_text=False,
-            )
-            # faster-whisper is also the primary transcript for speech clips.
-            self._transcribe_parallel(
-                "speech",
-                input_manifest=speech_source,
-                output_manifest=speech_output,
                 audio_root=self.root,
-                cache_dir=self.work_dir / "anime_whisper_speech_cache",
+                cache_dir=self.work_dir / "asr_cache",
                 replace_text=True,
             )
 
         self.run_stage(
             "anime_whisper",
             fingerprint=fingerprint,
-            outputs=(output, speech_output),
+            outputs=(combined, output),
             action=action,
         )
 
     def context_correction(self) -> None:
-        dataset = self.nonverbal_dir / "dataset"
-        nonverbal_input = dataset / "manifests" / "events_transcribed.jsonl"
-        nonverbal_output = dataset / "manifests" / "events_corrected.jsonl"
-        # Speech input carries anime-whisper primary text (grok_text preserved).
+        # The whole clip stream (speech + nonverbal) is corrected and
+        # classified as one timeline; train.jsonl falls out of row status.
         speech_all = self.work_dir / "all_aw.jsonl"
         fingerprint = _hash(
             {
                 "speech": _path_record(speech_all),
-                "nonverbal": _path_record(nonverbal_input),
                 "agents": self.args.correction_agents,
+                "grok_model": self.args.correction_grok_model,
                 "batch": self.args.correction_batch_size,
                 "context": self.args.correction_context_segments,
             }
@@ -626,57 +577,26 @@ class PipelineRunner:
             str(speech_all),
             "--speech-output-dir",
             str(self.work_dir),
-            "--nonverbal-input",
-            str(nonverbal_input),
-            "--nonverbal-output",
-            str(nonverbal_output),
             "--cache-dir",
             str(self.work_dir / "text_correction"),
             "--agent-priority",
             self.args.correction_agents,
+            "--grok-model",
+            self.args.correction_grok_model,
             "--target-batch-size",
             str(self.args.correction_batch_size),
             "--context-segments",
             str(self.args.correction_context_segments),
             "--workers",
             str(self.args.correction_workers),
+            "--timeout-seconds",
+            str(self.args.correction_timeout_seconds),
         ]
         self.run_stage(
             "context_correction",
             fingerprint=fingerprint,
-            outputs=(nonverbal_output, self.work_dir / "train.jsonl"),
+            outputs=(self.work_dir / "train.jsonl",),
             action=lambda: self.run_command("context_correction", command),
-        )
-
-    def training_manifests(self) -> None:
-        events = self.nonverbal_dir / "dataset" / "manifests" / "events_corrected.jsonl"
-        speech = self.work_dir / "train.jsonl"
-        fingerprint = _hash(
-            {"events": _path_record(events), "speech": _path_record(speech), "schema": 3}
-        )
-        command = [
-            sys.executable,
-            "-m",
-            "dataset.cli.prepare_nonverbal_training",
-            "--events",
-            str(events),
-            "--output-dir",
-            str(self.nonverbal_training_dir),
-            "--speech-manifest",
-            str(speech),
-            "--project-root",
-            str(self.root),
-            "--audio-base-dir",
-            str(self.nonverbal_dir / "dataset"),
-        ]
-        self.run_stage(
-            "training_manifests",
-            fingerprint=fingerprint,
-            outputs=(
-                self.nonverbal_training_dir / "train_nonverbal.jsonl",
-                self.nonverbal_training_dir / "train_combined.jsonl",
-            ),
-            action=lambda: self.run_command("training_manifests", command),
         )
 
     def _latent_one(self, label: str, input_manifest: Path) -> Path:
@@ -723,9 +643,9 @@ class PipelineRunner:
             "--device",
             self.primary_device,
             "--prefetch",
-            "8",
+            "16",
             "--prefetch-workers",
-            "4",
+            "8",
             "--flush-every",
             "100",
         ]
@@ -763,31 +683,24 @@ class PipelineRunner:
             except (OSError, json.JSONDecodeError):
                 return tuple(outputs)
             if isinstance(payload, dict):
-                for key in ("speech", "nonverbal"):
-                    value = payload.get(key)
-                    if isinstance(value, str) and value:
-                        outputs.append(Path(value))
+                value = payload.get("clips")
+                if isinstance(value, str) and value:
+                    outputs.append(Path(value))
         return tuple(outputs)
 
     def latents(self) -> None:
-        speech = self.work_dir / "train.jsonl"
-        nonverbal = self.nonverbal_training_dir / "train_nonverbal.jsonl"
+        clips = self.work_dir / "train.jsonl"
         fingerprint = _hash(
             {
-                "speech": _path_record(speech),
-                "nonverbal": _path_record(nonverbal),
+                "clips": _path_record(clips),
                 "encode": LATENT_ENCODE_PARAMS,
             }
         )
         selected = self.manifest_dir / ".full_pipeline" / "selected_latents.json"
 
         def action() -> None:
-            speech_output = self._latent_one("speech", speech)
-            nonverbal_output = self._latent_one("nonverbal", nonverbal)
-            _atomic_write_json(
-                selected,
-                {"speech": speech_output.as_posix(), "nonverbal": nonverbal_output.as_posix()},
-            )
+            clips_output = self._latent_one("clips", clips)
+            _atomic_write_json(selected, {"clips": clips_output.as_posix()})
 
         self.run_stage(
             "latents",
@@ -809,15 +722,13 @@ class PipelineRunner:
                 "run the latents stage first (for example with --start-at latents)"
             )
         selected = json.loads(selected_path.read_text(encoding="utf-8"))
-        speech = Path(selected["speech"]).resolve()
-        nonverbal = Path(selected["nonverbal"]).resolve()
-        for label, manifest in (("speech", speech), ("nonverbal", nonverbal)):
-            if not manifest.is_file():
-                raise RuntimeError(
-                    f"{label} latent manifest referenced by {selected_path} is missing: "
-                    f"{manifest}; re-run the latents stage (--force-stage latents)"
-                )
-        fingerprint = _hash({"speech": _path_record(speech), "nonverbal": _path_record(nonverbal)})
+        clips = Path(selected["clips"]).resolve()
+        if not clips.is_file():
+            raise RuntimeError(
+                f"latent manifest referenced by {selected_path} is missing: "
+                f"{clips}; re-run the latents stage (--force-stage latents)"
+            )
+        fingerprint = _hash({"clips": _path_record(clips)})
         final = self.manifest_dir / "train.jsonl"
         receipt = self.work_dir / "full_pipeline" / "last_success.json"
 
@@ -829,14 +740,12 @@ class PipelineRunner:
                 "-m",
                 "dataset.cli.merge_latent_manifests",
                 "--input",
-                str(speech),
-                "--input",
-                str(nonverbal),
+                str(clips),
                 "--output",
                 str(temporary),
             ]
             self.run_command("publish", command)
-            expected = _line_count(speech) + _line_count(nonverbal)
+            expected = _line_count(clips)
             actual = _line_count(temporary)
             if actual != expected:
                 raise RuntimeError(f"merged manifest has {actual}/{expected} rows")
@@ -863,10 +772,7 @@ class PipelineRunner:
                     "completed_at": _now(),
                     "manifest": final.as_posix(),
                     "rows": actual,
-                    "speech_rows": _line_count(speech),
-                    "nonverbal_rows": _line_count(nonverbal),
-                    "speech_latent_manifest": speech.as_posix(),
-                    "nonverbal_latent_manifest": nonverbal.as_posix(),
+                    "latent_manifest": clips.as_posix(),
                     "previous_manifest_backup": backup.as_posix() if backup else None,
                     "fingerprint": fingerprint,
                 },
@@ -905,14 +811,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--data-root", type=Path, default=Path("dataset/data"))
     parser.add_argument("--work-dir", type=Path, default=Path("dataset/data/pipeline"))
-    parser.add_argument(
-        "--nonverbal-dir", type=Path, default=Path("dataset/data/pipeline/nonverbal_events_new")
-    )
-    parser.add_argument(
-        "--nonverbal-training-dir",
-        type=Path,
-        default=Path("dataset/data/pipeline/nonverbal_training_all"),
-    )
     parser.add_argument("--manifest-dir", type=Path, default=Path("dataset/data/manifests"))
     parser.add_argument("--latent-root", type=Path, default=Path("dataset/data/latents/full_pipeline"))
     parser.add_argument("--gpus", default="all")
@@ -923,18 +821,39 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=300.0,
         help="Exclude source audio at or below this duration from every pipeline stage.",
     )
-    parser.add_argument("--beats-batch-size", type=int, default=32)
-    parser.add_argument("--classifier-batch-size", type=int, default=64)
+    parser.add_argument(
+        "--speech-shards",
+        type=int,
+        default=24,
+        help=(
+            "Parallel prepare_speech worker processes (CPU-bound stage); the "
+            "light VAD load is spread round-robin over the selected GPUs."
+        ),
+    )
+    parser.add_argument(
+        "--asr-workers-per-gpu",
+        type=int,
+        default=2,
+        help=(
+            "faster-whisper worker processes per GPU during transcription. "
+            "Each worker batches clips through CTranslate2 (~5GB VRAM each)."
+        ),
+    )
     parser.add_argument("--anime-batch-size", type=int, default=16)
     parser.add_argument("--audio-padding-seconds", type=float, default=0.35)
     parser.add_argument("--audio-padding-ms", type=int, default=350)
     parser.add_argument("--correction-agents", default="grok")
+    parser.add_argument(
+        "--correction-grok-model",
+        default="grok-4.5",
+        help="Grok model pinned for transcript correction/classification.",
+    )
     parser.add_argument("--correction-batch-size", type=int, default=16)
     parser.add_argument("--correction-context-segments", type=int, default=10)
-    parser.add_argument("--correction-workers", type=int, default=12)
-    parser.add_argument(
-        "--allow-model-download", action=argparse.BooleanOptionalAction, default=True
-    )
+    # 256 workers overwhelmed the grok CLI (mass 300 s timeouts); 128 with a
+    # longer timeout clears the queue without failed batches.
+    parser.add_argument("--correction-workers", type=int, default=128)
+    parser.add_argument("--correction-timeout-seconds", type=float, default=600.0)
     parser.add_argument(
         "--rebuild-clips",
         action=argparse.BooleanOptionalAction,
@@ -959,8 +878,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     for name in (
-        "beats_batch_size",
-        "classifier_batch_size",
         "anime_batch_size",
         "correction_batch_size",
         "correction_workers",
