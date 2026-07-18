@@ -23,11 +23,11 @@ from typing import Any
 from dataset._io_utils import atomic_write_text
 from dataset.acoustic_segmentation import ACOUSTIC_SEGMENTATION_VERSION
 from dataset.ero_voice_classifier import SPACE_REPO_ID, SPACE_REVISION
-from dataset.grok_stt import SILERO_VAD_REPO
+from dataset.speech_pipeline import SILERO_VAD_REPO
 from dataset.nonverbal_clustering import BEATS_MODEL_NAME
 
 SCHEMA_VERSION = 3
-TEXT_TAG_SCHEMA = "ja_nonverbal_class_transcript_label_v3"
+TEXT_TAG_SCHEMA = "ja_nonverbal_transcript_only_v4"
 TARGET_CLASSES = ("aegi", "chupa")
 CLASS_TEXT = {
     "aegi": "喘ぎ声",
@@ -47,16 +47,15 @@ class NonverbalTrainingManifestConfig:
 
     target_classes: tuple[str, ...] = TARGET_CLASSES
     minimum_seconds: float = 5.0
-    # 15.0 matches the acoustic segmentation cap (--event-max-seconds 15).
-    # It was 12.0 before, which systematically routed natural 12-15 s events
-    # to review; lower it again only as a deliberate quality gate.
-    maximum_seconds: float = 15.0
+    # 20.0 matches the acoustic segmentation cap (SegmentationConfig.max_seconds)
+    # and the speech clip range (5-20 s), so both streams share one duration policy.
+    maximum_seconds: float = 20.0
     classifier_minimum_probability: float = 0.75
     classifier_minimum_margin: float = 0.20
     neighbor_minimum_count: int = 3
     neighbor_minimum_support: float = 0.80
     neighbor_minimum_similarity: float = 0.92
-    # Grok speech clips deliberately carry about 120 ms of boundary padding.
+    # Speech clips deliberately carry about 120 ms of boundary padding.
     # Requiring 500 ms avoids rejecting a clean nonverbal event merely because
     # that padding touches its edge, while still catching material duplication.
     speech_overlap_minimum_seconds: float = 0.50
@@ -257,25 +256,23 @@ def render_nonverbal_text(
     cluster: str | None,
     transcript: str | None = None,
 ) -> str:
-    """Render the stable plain-text condition without adding tokenizer tokens.
+    """Render the plain-text condition: the transcript content only.
 
-    Standard examples are ``喘ぎ声。ラベルc0007。`` and
-    ``フェラ音。ラベルk0012。``. ``cluster`` may be a full event cluster name;
-    the redundant matching class prefix is removed for human input.
+    The class (aegi/chupa) and cluster are NOT embedded in the text anymore;
+    they are published as separate manifest fields (``category`` /
+    ``cluster_token``). Returns an empty string when no usable transcript
+    exists — callers must route such rows to review.
     """
     label = str(final_label).strip().lower()
     if label not in CLASS_TEXT:
         raise ValueError(f"unsupported nonverbal class: {final_label!r}")
-    token, mismatch = _cluster_token(label, cluster)
+    _token, mismatch = _cluster_token(label, cluster)
     if mismatch:
         raise ValueError(f"cluster {cluster!r} does not belong to class {label!r}")
-    prefix = f"{CLASS_TEXT[label]}。"
     transcript_text = _clean_transcript_text(transcript)
-    if transcript_text:
-        prefix += transcript_text
-        if transcript_text[-1] not in "。！？!?…":
-            prefix += "。"
-    return f"{prefix}ラベル{token or '未設定'}。"
+    if transcript_text and transcript_text[-1] not in "。！？!?…":
+        transcript_text += "。"
+    return transcript_text
 
 
 def _usable_transcript(row: Mapping[str, Any]) -> str | None:
@@ -533,6 +530,10 @@ def prepare_nonverbal_training_rows(
             cluster if not cluster_mismatch else None,
             transcript_text,
         )
+        # Text is now transcript-only; rows without a usable transcript have
+        # nothing to train on and must be reviewed instead.
+        if not text:
+            reasons.append("missing_transcript")
         confidence_details, confidence_gates_evaluated = _confidence_reasons(
             row, final_label, settings
         )
@@ -583,6 +584,17 @@ def prepare_nonverbal_training_rows(
             row.setdefault("input_status", source_row.get("status"))
         row["text"] = text
         row["text_tag_schema"] = TEXT_TAG_SCHEMA
+        # The LLM correction stage classifies every segment from transcript and
+        # timeline context; its verdict wins over the acoustic classifier for
+        # the published label. An LLM "speech" verdict on a nonverbal event is
+        # a leak signal, so route it to review instead of training.
+        llm_category = str(row.get("llm_category", "") or "").strip().lower() or None
+        if llm_category in {"aegi", "chupa", "mixed"}:
+            row["category"] = llm_category
+        else:
+            row["category"] = final_label
+            if llm_category in {"speech", "other"}:
+                reasons.append(f"llm_category_{llm_category}")
         row["transcript_used"] = transcript_text is not None
         if transcript_text is not None:
             row["transcript_text"] = transcript_text
@@ -769,14 +781,13 @@ def _readme_text(
 ## text の規則
 
 既存の日本語 tokenizer をそのまま使い、特殊トークンは追加しません。
-`event_cluster` を優先し、未割当だけ `fallback_cluster` を使用します。
-anime-whisper と文脈校正で利用可能な文字起こしがある場合はclass名とラベルの間へ入れ、
-空・不確実・安全判定で棄却された文字起こしはclass名だけへフォールバックします。
+`text` は anime-whisper と文脈校正による文字起こし内容のみです。class と
+クラスタは text に埋め込まず、`category`（aegi/chupa）と `cluster_token` の
+別フィールドとして保存します。
 
-- `aegi_c0007` + `あっ、んっ……` → `喘ぎ声。あっ、んっ……ラベルc0007。`
-- `chupa_k0012` → `フェラ音。ラベルk0012。`
+- `aegi_c0007` + `あっ、んっ……` → text=`あっ、んっ……。` / category=`aegi` / cluster_token=`c0007`
+- 文字起こしが空・不確実・棄却の行は `missing_transcript` として review 側へ回します。
 
-推論時も同じ文字列を人が入力できます。クラスタ番号は音響上の細分類で、意味名ではありません。
 低信頼、長さ範囲外、speech区間と重複する `aegi / chupa` は review 側だけです。
 
 ## 音声区切りと分類モデル
@@ -787,7 +798,7 @@ anime-whisper と文脈校正で利用可能な文字起こしがある場合は
 - 上位class分類: `{SPACE_REPO_ID}@{SPACE_REVISION}`
 
 固定5秒では切らず、自然区切りを先に作ります。同じclassが連続する区間を
-5〜12秒程度へまとめ、5秒に届かない孤立音は混ぜ物を避けるため公開しません。
+5〜20秒程度へまとめ、5秒に届かない孤立音は混ぜ物を避けるため公開しません。
 公開する `aegi` と `chupa` の中だけをBEATsで細分類しています。
 
 ## DACVAE latent の生成と最終統合
@@ -804,7 +815,7 @@ uv run --no-sync irodori-prepare-manifest `
   --audio-column audio `
   --text-column text `
   --speaker-column speaker_id `
-  --speaker-id-prefix grok-stt `
+  --speaker-id-prefix full-data-pipeline `
   --target-sample-rate 48000 `
   --output-manifest dataset/data/manifests/nonverbal.jsonl `
   --latent-dir dataset/data/latents/nonverbal `
@@ -816,7 +827,7 @@ uv run --no-sync irodori-prepare-manifest `
 
 ```powershell
 uv run --no-sync python -m dataset.cli.merge_latent_manifests `
-  --input dataset/data/manifests/grok_stt.jsonl `
+  --input dataset/data/manifests/speech.jsonl `
   --input dataset/data/manifests/nonverbal.jsonl `
   --output dataset/data/manifests/train.jsonl
 ```
@@ -918,12 +929,9 @@ def write_nonverbal_training_manifests(
                     "final_label": "aegi",
                     "cluster": "aegi_c0007",
                     "transcript": "あっ、んっ……",
-                    "text": "喘ぎ声。あっ、んっ……ラベルc0007。",
-                },
-                {
-                    "final_label": "chupa",
-                    "cluster": "chupa_k0012",
-                    "text": "フェラ音。ラベルk0012。",
+                    "text": "あっ、んっ……。",
+                    "category": "aegi",
+                    "cluster_token": "c0007",
                 },
             ],
         },

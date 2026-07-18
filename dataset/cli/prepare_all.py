@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,11 +24,7 @@ from dataset._io_utils import (
 from dataset._io_utils import (
     replace_with_retry,
 )
-from dataset.grok_stt import (
-    GrokSubscriptionAuth,
-    discover_audio_sources,
-    load_cached_response,
-)
+from dataset.speech_pipeline import discover_audio_sources
 
 PIPELINE_SCHEMA_VERSION = 1
 STAGES = (
@@ -302,40 +299,12 @@ class PipelineRunner:
         sources = self.selected_sources()
         if not sources:
             raise RuntimeError(f"No supported audio files found under {self.data_root}")
-        cached = sum(1 for source in sources if load_cached_response(self.work_dir, source))
-        missing = len(sources) - cached
+        cached = sum(
+            1
+            for source in sources
+            if (self.work_dir / "vad_responses" / f"{source.source_id}.json").is_file()
+        )
         total_hours = sum(source.duration for source in sources) / 3600.0
-        speech_will_run = "speech" in selected_stages
-        if missing and self.args.stt_auth_mode == "subscription":
-            if speech_will_run:
-                try:
-                    metadata = GrokSubscriptionAuth(
-                        auth_file=self.args.grok_auth_file,
-                        cli_command=self.args.grok_cli,
-                    ).validate()
-                except Exception as exc:
-                    self._preflight_problem(f"grok subscription login is unavailable: {exc}")
-                else:
-                    print(
-                        "preflight grok_subscription_login=valid "
-                        f"expires_at={metadata.get('expires_at') or 'unspecified'}",
-                        flush=True,
-                    )
-            else:
-                print(
-                    "preflight warning: uncached speech exists, but the selected stage range "
-                    "does not run speech STT",
-                    flush=True,
-                )
-        elif missing and not os.environ.get(self.args.xai_api_key_env, "").strip():
-            message = (
-                f"{missing}/{len(sources)} selected sources need Grok STT, but "
-                f"{self.args.xai_api_key_env} is not set for --stt-auth-mode api-key"
-            )
-            if speech_will_run:
-                self._preflight_problem(message)
-            else:
-                print(f"preflight warning: {message}", flush=True)
         if (
             "context_correction" in selected_stages
             and shutil.which("codex") is None
@@ -362,7 +331,7 @@ class PipelineRunner:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         disk = shutil.disk_usage(self.data_root)
         print(
-            f"preflight sources={len(sources)} cached_stt={cached} missing_stt={missing} "
+            f"preflight sources={len(sources)} cached_vad={cached} "
             f"duration={total_hours:.3f}h gpus={gpu_display} "
             f"source_duration=>{self.args.min_source_seconds:.3f}s "
             f"free_disk={disk.free / 1024**3:.1f}GiB",
@@ -378,7 +347,7 @@ class PipelineRunner:
                 "sources": [source.metadata() for source in sources],
                 "vad": {"speech_pad_ms": self.args.audio_padding_ms},
                 "clip_padding": self.args.audio_padding_seconds,
-                "stt_auth_mode": self.args.stt_auth_mode,
+                "segmentation": "vad-5-20s",
                 "min_source_seconds": self.args.min_source_seconds,
                 "max_source_errors": self.args.max_source_errors,
             }
@@ -386,38 +355,36 @@ class PipelineRunner:
         command = [
             sys.executable,
             "-m",
-            "dataset.cli.prepare_grok_stt",
+            "dataset.cli.prepare_speech",
             "--input-dir",
             str(self.data_root),
             "--output-dir",
             str(self.work_dir),
+            "--project-root",
+            str(self.root),
             "--min-source-seconds",
             str(self.args.min_source_seconds),
-            "--auth-mode",
-            self.args.stt_auth_mode,
-            "--api-key-env",
-            self.args.xai_api_key_env,
-            "--grok-cli",
-            self.args.grok_cli,
-            "--vad-devices",
-            ",".join(f"cuda:{index}" for index in self.gpu_indices),
+            "--vad-device",
+            self.primary_device,
             "--vad-speech-pad-ms",
             str(self.args.audio_padding_ms),
             "--padding-seconds",
             str(self.args.audio_padding_seconds),
-            "--workers",
-            str(self.args.stt_workers),
-            "--vad-prefetch-sources",
-            str(self.args.vad_prefetch_sources),
             "--max-source-errors",
             str(self.args.max_source_errors),
         ]
+        for directory in (
+            self.work_dir,
+            self.nonverbal_dir,
+            self.nonverbal_training_dir,
+            self.manifest_dir,
+            self.latent_root,
+        ):
+            command.extend(["--exclude-dir", str(directory)])
         if self.args.rebuild_clips:
             # Clips are content-addressed (id embeds start/end ms) and written
             # atomically, so re-encoding them is opt-in instead of the default.
             command.append("--rebuild-clips")
-        if self.args.grok_auth_file is not None:
-            command.extend(["--grok-auth-file", str(self.args.grok_auth_file)])
         if self.args.max_files is not None:
             command.extend(["--max-files", str(self.args.max_files)])
         self.run_stage(
@@ -428,7 +395,7 @@ class PipelineRunner:
         )
 
     def nonverbal_features(self) -> None:
-        raw_paths = sorted((self.work_dir / "raw_responses").glob("*.json"))
+        raw_paths = sorted((self.work_dir / "vad_responses").glob("*.json"))
         fingerprint = _hash(
             {
                 "raw": [_path_record(path) for path in raw_paths],
@@ -443,7 +410,7 @@ class PipelineRunner:
             "--data-root",
             str(self.data_root),
             "--raw-response-dir",
-            str(self.work_dir / "raw_responses"),
+            str(self.work_dir / "vad_responses"),
             "--output-dir",
             str(self.nonverbal_dir),
             "--beats-code-dir",
@@ -506,45 +473,142 @@ class PipelineRunner:
             action=lambda: self.run_command("nonverbal_classification", command),
         )
 
-    def anime_whisper(self) -> None:
-        dataset = self.nonverbal_dir / "dataset"
-        source = dataset / "manifests" / "events.jsonl"
-        output = dataset / "manifests" / "events_transcribed.jsonl"
-        fingerprint = _hash(
-            {
-                "events": _path_record(source),
-                "model": "litagin/anime-whisper@22e2008a8182b357da3922a6308d095008f72973",
-            }
-        )
-        command = [
+    def _merge_transcription_shards(
+        self, input_manifest: Path, shard_paths: Sequence[Path], output: Path
+    ) -> None:
+        """Reassemble sharded ASR outputs in the input manifest's row order."""
+        order: list[str] = []
+        with input_manifest.open("r", encoding="utf-8-sig") as handle:
+            for line in handle:
+                if line.strip():
+                    order.append(str(json.loads(line)["id"]))
+        by_id: dict[str, dict[str, Any]] = {}
+        for shard in shard_paths:
+            with shard.open("r", encoding="utf-8-sig") as handle:
+                for line in handle:
+                    if line.strip():
+                        row = json.loads(line)
+                        by_id[str(row["id"])] = row
+        missing = [row_id for row_id in order if row_id not in by_id]
+        if missing:
+            raise RuntimeError(
+                f"transcription shards are missing {len(missing)} row(s), "
+                f"first: {missing[:5]}"
+            )
+        temporary = output.with_name(f".{output.name}.tmp")
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            for row_id in order:
+                handle.write(json.dumps(by_id[row_id], ensure_ascii=False) + "\n")
+        os.replace(temporary, output)
+
+    def _transcribe_parallel(
+        self,
+        label: str,
+        *,
+        input_manifest: Path,
+        output_manifest: Path,
+        audio_root: Path,
+        cache_dir: Path,
+        replace_text: bool,
+    ) -> None:
+        """Run one ASR process per GPU over row shards, then merge in order."""
+        base = [
             sys.executable,
             "-m",
             "dataset.cli.prepare_anime_whisper",
             "--input-manifest",
-            str(source),
-            "--output-manifest",
-            str(output),
+            str(input_manifest),
             "--audio-root",
-            str(dataset),
+            str(audio_root),
             "--cache-dir",
-            str(self.nonverbal_dir / "anime_whisper_cache"),
-            "--device",
-            self.primary_device,
+            str(cache_dir),
             "--batch-size",
             str(self.args.anime_batch_size),
         ]
+        if replace_text:
+            base.append("--replace-text")
+        gpus = self.gpu_indices
+        if len(gpus) == 1:
+            command = [*base, "--device", f"cuda:{gpus[0]}", "--output-manifest", str(output_manifest)]
+            self.run_command(f"anime_whisper_{label}", command)
+            return
+        shard_paths: list[Path] = []
+        jobs: list[tuple[str, list[str]]] = []
+        for shard_index, gpu in enumerate(gpus):
+            shard_path = output_manifest.with_name(f"{output_manifest.name}.shard{shard_index}")
+            shard_paths.append(shard_path)
+            jobs.append(
+                (
+                    f"anime_whisper_{label}_gpu{gpu}",
+                    [
+                        *base,
+                        "--device",
+                        f"cuda:{gpu}",
+                        "--output-manifest",
+                        str(shard_path),
+                        "--shard-index",
+                        str(shard_index),
+                        "--shard-count",
+                        str(len(gpus)),
+                    ],
+                )
+            )
+        with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+            futures = [executor.submit(self.run_command, stage, cmd) for stage, cmd in jobs]
+            for future in futures:
+                future.result()
+        self._merge_transcription_shards(input_manifest, shard_paths, output_manifest)
+        for shard in shard_paths:
+            shard.unlink(missing_ok=True)
+
+    def anime_whisper(self) -> None:
+        dataset = self.nonverbal_dir / "dataset"
+        source = dataset / "manifests" / "events.jsonl"
+        output = dataset / "manifests" / "events_transcribed.jsonl"
+        speech_source = self.work_dir / "all.jsonl"
+        speech_output = self.work_dir / "all_aw.jsonl"
+        fingerprint = _hash(
+            {
+                "events": _path_record(source),
+                "speech": _path_record(speech_source),
+                "backend": "faster-whisper",
+                "model": "TransWithAI/whisper-ja-1.5B-ct2",
+                "speech_replace_text": True,
+            }
+        )
+
+        def action() -> None:
+            self._transcribe_parallel(
+                "nonverbal",
+                input_manifest=source,
+                output_manifest=output,
+                audio_root=dataset,
+                cache_dir=self.nonverbal_dir / "anime_whisper_cache",
+                replace_text=False,
+            )
+            # faster-whisper is also the primary transcript for speech clips.
+            self._transcribe_parallel(
+                "speech",
+                input_manifest=speech_source,
+                output_manifest=speech_output,
+                audio_root=self.root,
+                cache_dir=self.work_dir / "anime_whisper_speech_cache",
+                replace_text=True,
+            )
+
         self.run_stage(
             "anime_whisper",
             fingerprint=fingerprint,
-            outputs=(output,),
-            action=lambda: self.run_command("anime_whisper", command),
+            outputs=(output, speech_output),
+            action=action,
         )
 
     def context_correction(self) -> None:
         dataset = self.nonverbal_dir / "dataset"
         nonverbal_input = dataset / "manifests" / "events_transcribed.jsonl"
         nonverbal_output = dataset / "manifests" / "events_corrected.jsonl"
-        speech_all = self.work_dir / "all.jsonl"
+        # Speech input carries anime-whisper primary text (grok_text preserved).
+        speech_all = self.work_dir / "all_aw.jsonl"
         fingerprint = _hash(
             {
                 "speech": _path_record(speech_all),
@@ -834,30 +898,23 @@ class PipelineRunner:
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Fully automate Grok STT, local VAD/nonverbal GPU inference, anime-whisper, "
-            "contextual Codex/Claude correction, DACVAE latents, and atomic publication."
+            "Fully automate local VAD segmentation, nonverbal GPU inference, "
+            "anime-whisper transcription, contextual LLM correction, DACVAE "
+            "latents, and atomic publication. No cloud STT is involved."
         )
     )
     parser.add_argument("--data-root", type=Path, default=Path("dataset/data"))
-    parser.add_argument("--work-dir", type=Path, default=Path("dataset/data/grok_stt"))
+    parser.add_argument("--work-dir", type=Path, default=Path("dataset/data/pipeline"))
     parser.add_argument(
-        "--nonverbal-dir", type=Path, default=Path("dataset/data/grok_stt/nonverbal_events_new")
+        "--nonverbal-dir", type=Path, default=Path("dataset/data/pipeline/nonverbal_events_new")
     )
     parser.add_argument(
         "--nonverbal-training-dir",
         type=Path,
-        default=Path("dataset/data/grok_stt/nonverbal_training_all"),
+        default=Path("dataset/data/pipeline/nonverbal_training_all"),
     )
     parser.add_argument("--manifest-dir", type=Path, default=Path("dataset/data/manifests"))
     parser.add_argument("--latent-root", type=Path, default=Path("dataset/data/latents/full_pipeline"))
-    parser.add_argument(
-        "--stt-auth-mode",
-        choices=("subscription", "api-key"),
-        default="subscription",
-    )
-    parser.add_argument("--xai-api-key-env", default="XAI_API_KEY")
-    parser.add_argument("--grok-cli", default="grok")
-    parser.add_argument("--grok-auth-file", type=Path, default=None)
     parser.add_argument("--gpus", default="all")
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument(
@@ -866,14 +923,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=300.0,
         help="Exclude source audio at or below this duration from every pipeline stage.",
     )
-    parser.add_argument("--stt-workers", type=int, default=4)
-    parser.add_argument("--vad-prefetch-sources", type=int, default=8)
     parser.add_argument("--beats-batch-size", type=int, default=32)
     parser.add_argument("--classifier-batch-size", type=int, default=64)
     parser.add_argument("--anime-batch-size", type=int, default=16)
     parser.add_argument("--audio-padding-seconds", type=float, default=0.35)
     parser.add_argument("--audio-padding-ms", type=int, default=350)
-    parser.add_argument("--correction-agents", default="codex,claude,grok")
+    parser.add_argument("--correction-agents", default="grok")
     parser.add_argument("--correction-batch-size", type=int, default=16)
     parser.add_argument("--correction-context-segments", type=int, default=10)
     parser.add_argument("--correction-workers", type=int, default=12)
@@ -904,8 +959,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     for name in (
-        "stt_workers",
-        "vad_prefetch_sources",
         "beats_batch_size",
         "classifier_batch_size",
         "anime_batch_size",

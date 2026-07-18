@@ -90,7 +90,7 @@ class EventMergeConfig:
 
     labels: tuple[str, ...] = ("aegi", "chupa")
     minimum_seconds: float = 5.0
-    max_seconds: float = 12.0
+    max_seconds: float = 20.0
     adjacency_tolerance_seconds: float = 0.005
     strong_boundary_score: float = 2.0
     hard_boundary_reasons: tuple[str, ...] = (

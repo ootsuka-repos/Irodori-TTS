@@ -21,10 +21,10 @@ from dataset._textnorm import meaningful_text, normalize_transcript
 
 ANIME_WHISPER_MODEL = "litagin/anime-whisper"
 ANIME_WHISPER_REVISION = "22e2008a8182b357da3922a6308d095008f72973"
+FASTER_WHISPER_MODEL = "TransWithAI/whisper-ja-1.5B-ct2"
 LOCAL_ASR_CACHE_SCHEMA_VERSION = 1
 
-# Kept in sync with grok_stt.SegmentationConfig defaults so both ASR streams
-# apply the same transcript-density plausibility gate.
+# Transcript-density plausibility gate shared by every ASR stream.
 MIN_CHARS_PER_SECOND = 0.20
 MAX_CHARS_PER_SECOND = 20.0
 
@@ -138,6 +138,99 @@ class AnimeWhisperTranscriber:
                 raise RuntimeError("anime-whisper returned a non-object result")
             result.append(normalize_transcript(str(output.get("text", ""))))
         return result
+
+
+@dataclass(frozen=True)
+class FasterWhisperConfig:
+    """CTranslate2 inference settings for the whisper-ja-1.5B conversion.
+
+    ``repetition_penalty`` plus the compression-ratio fallback keeps the known
+    repetition loops of the base finetune in check without banning the
+    legitimate onomatopoeia repeats this corpus is full of.
+    """
+
+    model: str = FASTER_WHISPER_MODEL
+    device: str = "cuda"
+    device_index: int = 0
+    compute_type: str = "float16"
+    language: str = "ja"
+    beam_size: int = 5
+    repetition_penalty: float = 1.1
+    compression_ratio_threshold: float = 2.4
+    log_prob_threshold: float = -1.0
+    no_speech_threshold: float = 0.6
+    condition_on_previous_text: bool = False
+
+    def __post_init__(self) -> None:
+        if self.beam_size <= 0:
+            raise ValueError("beam_size must be positive")
+        if self.repetition_penalty < 1.0:
+            raise ValueError("repetition_penalty must be >= 1.0")
+
+
+class FasterWhisperTranscriber:
+    """Lazy faster-whisper (CTranslate2) model required to execute on CUDA."""
+
+    def __init__(self, config: FasterWhisperConfig | None = None) -> None:
+        self.config = config or FasterWhisperConfig()
+        self._model: Any | None = None
+
+    @property
+    def metadata(self) -> Mapping[str, Any]:
+        return {
+            "provider": "local-faster-whisper",
+            "model": self.config.model,
+            "device": self.config.device,
+            "compute_type": self.config.compute_type,
+            "language": self.config.language,
+            "beam_size": self.config.beam_size,
+            "repetition_penalty": self.config.repetition_penalty,
+            "condition_on_previous_text": self.config.condition_on_previous_text,
+            "audio_uploaded": False,
+        }
+
+    def _load(self) -> Any:
+        if self._model is not None:
+            return self._model
+        if self.config.device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested for faster-whisper but is unavailable")
+        # ctranslate2 resolves cuDNN/cuBLAS DLLs from PATH; torch ships them.
+        import os
+
+        torch_lib = str(Path(torch.__file__).parent / "lib")
+        os.environ["PATH"] = torch_lib + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(torch_lib)
+        from faster_whisper import WhisperModel
+
+        self._model = WhisperModel(
+            self.config.model,
+            device=self.config.device,
+            device_index=self.config.device_index,
+            compute_type=self.config.compute_type,
+        )
+        return self._model
+
+    def transcribe(self, audio_paths: Sequence[Path]) -> list[str]:
+        if not audio_paths:
+            return []
+        model = self._load()
+        results: list[str] = []
+        for path in audio_paths:
+            segments, _info = model.transcribe(
+                str(path),
+                language=self.config.language,
+                beam_size=self.config.beam_size,
+                repetition_penalty=self.config.repetition_penalty,
+                compression_ratio_threshold=self.config.compression_ratio_threshold,
+                log_prob_threshold=self.config.log_prob_threshold,
+                no_speech_threshold=self.config.no_speech_threshold,
+                condition_on_previous_text=self.config.condition_on_previous_text,
+                vad_filter=False,
+            )
+            text = "".join(segment.text for segment in segments)
+            results.append(normalize_transcript(text))
+        return results
 
 
 def transcript_review_reasons(
@@ -368,7 +461,7 @@ def transcribe_manifest_rows(
         result = cached_results[index]
         row["transcript_text_raw"] = str(result.get("text", ""))
         row["transcript_text"] = str(result.get("text", ""))
-        row["transcript_backend"] = "anime-whisper"
+        row["transcript_backend"] = str(model_metadata.get("provider", "local-asr"))
         row["transcript_model"] = model_metadata.get("model")
         row["transcript_model_revision"] = model_metadata.get("revision")
         row["transcript_status"] = result.get("status", "error")

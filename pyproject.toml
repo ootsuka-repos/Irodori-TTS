@@ -13,10 +13,11 @@ dependencies = [
     "bitsandbytes>=0.49.2",
     "dacvae",
     "datasets>=3.0.0",
-    "huggingface-hub>=0.34.0,<1.0",
+    "huggingface-hub>=1.5.0",
     "llvmlite>=0.40.0",
     "numba>=0.57.0",
     "peft>=0.18.0",
+    "pyannote-audio>=3.1",
     "pyyaml>=6.0",
     "requests>=2.32.0",
     "safetensors>=0.7.0",
@@ -29,16 +30,18 @@ dependencies = [
     "torch>=2.10.0",
     "torchaudio>=2.10.0",
     "torchcodec>=0.10.0,<0.11.0",
-    "transformers<5",
+    "transformers>=5.4.0",
     "tqdm>=4.67.3",
     "wandb>=0.17.0",
+    "faster-whisper>=1.2.1",
+    "onnxruntime<1.24",
 ]
 
 [project.scripts]
 irodori-train = "train.cli.train:main"
 irodori-infer = "inference.cli.infer:main"
 irodori-prepare-manifest = "dataset.cli.prepare_manifest:main"
-irodori-prepare-grok-stt = "dataset.cli.prepare_grok_stt:main"
+irodori-prepare-speech = "dataset.cli.prepare_speech:main"
 irodori-prepare-anime-whisper = "dataset.cli.prepare_anime_whisper:main"
 irodori-correct-transcripts = "dataset.cli.correct_transcripts:main"
 irodori-prepare-all = "dataset.cli.prepare_all:main"

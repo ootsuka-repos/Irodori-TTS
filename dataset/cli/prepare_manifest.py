@@ -181,6 +181,8 @@ class _PreparedItem:
     speaker_id: str | None = None
     row_id: str | None = None
     source_uid: str | None = None
+    category: str | None = None
+    cluster_token: str | None = None
     skip_reason: str | None = None
     error: str | None = None
 
@@ -210,6 +212,9 @@ def _prepare_example(
         # clips (needed for auditing and group-aware validation splits).
         row_id = _coerce_text(_get_column_value(sample, "id", "")).strip() or None
         source_uid = _coerce_text(_get_column_value(sample, "source_uid", "")).strip() or None
+        # Content-type labels live outside the text now; forward them verbatim.
+        category = _coerce_text(_get_column_value(sample, "category", "")).strip() or None
+        cluster_token = _coerce_text(_get_column_value(sample, "cluster_token", "")).strip() or None
 
         speaker_id: str | None = None
         if args.speaker_columns:
@@ -275,6 +280,8 @@ def _prepare_example(
             speaker_id=speaker_id,
             row_id=row_id,
             source_uid=source_uid,
+            category=category,
+            cluster_token=cluster_token,
         )
     except Exception as exc:
         return _PreparedItem(
@@ -784,6 +791,10 @@ def _run_worker(
             payload["id"] = item.row_id
         if item.source_uid is not None:
             payload["source_uid"] = item.source_uid
+        if item.category is not None:
+            payload["category"] = item.category
+        if item.cluster_token is not None:
+            payload["cluster_token"] = item.cluster_token
         out_f.write(json.dumps(payload, ensure_ascii=False) + "\n")
         written += 1
         if args.flush_every > 0 and written % args.flush_every == 0:

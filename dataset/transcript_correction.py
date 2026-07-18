@@ -21,7 +21,11 @@ from typing import Any
 from dataset._io_utils import atomic_write_json as _atomic_write_json
 from dataset._textnorm import compact_for_similarity, normalize_transcript
 
-CORRECTION_PROMPT_VERSION = "ja-asr-context-v2"
+CORRECTION_PROMPT_VERSION = "ja-asr-context-classify-v3"
+
+# Closed set the LLM assigns to every target segment. "mixed" covers e.g.
+# フェラしながらセリフ; "other" is non-vocal noise / unclassifiable content.
+CONTENT_CATEGORIES = ("speech", "aegi", "chupa", "mixed", "other")
 
 # Rows without a usable start time must not interleave with real timestamps;
 # they are parked (stably, by row index) after every timed segment.
@@ -41,8 +45,12 @@ CORRECTION_SCHEMA: dict[str, Any] = {
                         "type": "string",
                         "enum": ["unchanged", "corrected", "uncertain"],
                     },
+                    "category": {
+                        "type": "string",
+                        "enum": ["speech", "aegi", "chupa", "mixed", "other"],
+                    },
                 },
-                "required": ["id", "corrected_text", "status"],
+                "required": ["id", "corrected_text", "status", "category"],
                 "additionalProperties": False,
             },
         }
@@ -248,17 +256,26 @@ def _prompt_payload(batch: _Batch) -> dict[str, Any]:
 
 def _build_prompt(batch: _Batch) -> tuple[str, dict[str, Any]]:
     payload = _prompt_payload(batch)
-    prompt = f"""あなたは日本語音声認識結果の保守的な校正者です。
+    prompt = f"""あなたは日本語音声認識結果の保守的な校正者兼分類者です。
 同一音源の区間が時刻順に並んでいます。role=context_only は前後文脈として読むだけで、
-role=target の区間だけを校正してください。
+role=target の区間だけを校正・分類してください。
 
-規則:
+校正の規則:
 - 誤変換、脱字、明白な同音語、文脈上明白な句読点だけを直す。
 - 喘ぎ、息、フィラー、反復、擬音、くだけた口調、性的表現を削除・婉曲化しない。
 - 文体の美化、要約、言い換え、説明追加、未知内容の推測は禁止。
 - 聞き取りを確定できない場合は原文を保持して status=uncertain とする。
 - target_ids の全IDを1回ずつ返し、context_only のIDは返さない。
 - 変更不要なら原文をそのまま corrected_text に入れて status=unchanged とする。
+
+分類の規則 (category を必ず1つ付ける):
+- speech: 通常のセリフ・語り。多少の間投詞や息を含んでもセリフが主体。
+- aegi: 喘ぎ声が主体。あんっ/はぁっ等の反復で、意味のある文がほぼない。
+- chupa: フェラ・キス等の口唇音が主体。ちゅぱ/じゅる/れろ等の擬音が支配的。
+- mixed: セリフと喘ぎ/口唇音が同程度に混在 (例: フェラしながらセリフ)。
+- other: 上記のどれでもない (無意味な断片、ノイズ、判定不能)。
+- テキストと前後文脈から判定する。分類は校正statusと独立に必ず返す。
+
 - 出力は指定JSON Schemaだけに従う。
 
 input:
@@ -306,6 +323,7 @@ def _validate_result(payload: Mapping[str, Any], target_ids: Sequence[str]) -> l
         row_id = str(raw.get("id", "") or "")
         corrected = raw.get("corrected_text")
         status = str(raw.get("status", "") or "")
+        category = str(raw.get("category", "") or "")
         if row_id not in expected:
             raise CorrectionAgentError(f"agent returned unexpected id: {row_id!r}")
         if row_id in actual:
@@ -314,12 +332,15 @@ def _validate_result(payload: Mapping[str, Any], target_ids: Sequence[str]) -> l
             raise CorrectionAgentError(f"corrected_text for {row_id} is not a string")
         if status not in {"unchanged", "corrected", "uncertain"}:
             raise CorrectionAgentError(f"invalid correction status for {row_id}: {status!r}")
+        if category not in CONTENT_CATEGORIES:
+            raise CorrectionAgentError(f"invalid category for {row_id}: {category!r}")
         actual.add(row_id)
         result.append(
             {
                 "id": row_id,
                 "corrected_text": normalize_transcript(corrected),
                 "status": status,
+                "category": category,
             }
         )
     if actual != expected:
@@ -740,6 +761,7 @@ def correct_transcript_rows(
                     outcome = "rejected_unsafe"
                     rejected += 1
         target = speech[item.row_index] if item.kind == "speech" else nonverbal[item.row_index]
+        llm_category = suggestion.get("category") if suggestion else None
         metadata = {
             "prompt_version": CORRECTION_PROMPT_VERSION,
             "status": outcome,
@@ -749,16 +771,29 @@ def correct_transcript_rows(
             "input_hash": suggestion.get("input_hash") if suggestion else None,
             "similarity": round(similarity, 6),
             "length_ratio": round(length_ratio, 6),
+            "category": llm_category,
         }
         if item.kind == "speech":
             target["asr_text_raw"] = before
             target["asr_backend"] = item.backend
             target["text"] = after
             target["text_correction"] = metadata
+            # The LLM verdict is the published label; VAD said "speech" but
+            # moans/lip noise leak through, so record what the content really is.
+            target["category"] = llm_category or "speech"
+            if llm_category == "other":
+                # "other" means noise/unclassifiable — never trainable.
+                review_reasons = [str(r) for r in target.get("review_reasons", []) or []]
+                if "llm_category_other" not in review_reasons:
+                    review_reasons.append("llm_category_other")
+                target["review_reasons"] = review_reasons
+                target["status"] = "review"
         else:
             target["transcript_text_raw"] = before
             target["transcript_text"] = after
             target["transcript_correction"] = metadata
+            if llm_category:
+                target["llm_category"] = llm_category
         if outcome in {"accepted", "rejected_unsafe", "uncertain"}:
             change_rows.append(
                 {

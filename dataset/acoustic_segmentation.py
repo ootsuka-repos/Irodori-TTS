@@ -34,7 +34,7 @@ class AcousticSegmentationConfig:
     pause_depth_db: float = 18.0
     pause_min_ms: float = 200.0
     preferred_min_seconds: float = 1.2
-    max_seconds: float = 15.0
+    max_seconds: float = 20.0
     peak_min_distance_ms: float = 500.0
     strong_peak_quantile: float = 0.99
     candidate_peak_quantile: float = 0.90

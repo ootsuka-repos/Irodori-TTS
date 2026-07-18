@@ -70,7 +70,7 @@ def sanitize_manifest_id_component(value: Any, *, fallback: str) -> str:
 
 
 def sanitize_source_component(value: str, *, fallback: str, max_length: int) -> str:
-    """grok_stt-style path component sanitizer (collapses ``-_`` runs to ``_``)."""
+    """Pipeline path component sanitizer (collapses ``-_`` runs to ``_``)."""
     normalized = unicodedata.normalize("NFKC", value).strip()
     normalized = re.sub(r"\s+", "_", normalized)
     normalized = re.sub(r"[<>:\"/\\|?*\x00-\x1f]", "-", normalized)
