@@ -4,44 +4,50 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 概要
 
-Irodori-TTS: 日本語NSFW音声作品（ASMR等）を学習データとするTTSの学習・推論・データセット構築コードベース。ベースモデルは `Aratako/Irodori-TTS-500M-v3`、音声表現は `Aratako/Semantic-DACVAE-Japanese-32dim`（48kHz / hop 1920 = **25fps** / 32次元latent）のRectified Flow。
+Irodori-TTS: 日本語NSFW音声作品（ASMR等）を学習データとするTTSの学習・推論・データセット構築コードベース。ベースモデル `Aratako/Irodori-TTS-500M-v3`、音声表現は `Aratako/Semantic-DACVAE-Japanese-32dim`（48kHz / hop 1920 = **25fps** / 32次元latent）のRectified Flow。
 
 ## 環境・コマンド
 
-- Windows + uv 管理。venv同期: `uv sync --extra cu128 --all-groups`（**cu128 extraを忘れるとCPU版torchに置き換わる**）
-- 実行は `.\.venv\Scripts\python.exe`（GPU: RTX 5060 Ti 16GB ×2）
-- transformers は 5.x 系（`>=5.4`、hub 1.x）。ASRは faster-whisper + `TransWithAI/whisper-ja-1.5B-ct2`
-- テストスイートは無い。検証は各CLIの `--max-rows` / `--max-files` / `--dry-run` でのスモーク実行
+- Windows + uv 管理。同期は `uv sync --extra cu128 --all-groups`（**cu128 extraを忘れるとCPU版torchに置き換わる**）
+- 実行は `.\.venv\Scripts\python.exe`。GPU: RTX 5060 Ti 16GB ×2、CPU: Xeon 52コア/104スレッド
+- transformers 5.x / huggingface-hub 1.x / faster-whisper（CTranslate2）
+- テストスイートは無い。検証は各CLIの `--max-files` / `--max-rows` / `--dry-run` でのスモーク実行
 
 ```powershell
-# データセット全再作成（VAD→分類→文字起こし→Grok校正→latent→publish、再開可能）
-python -m dataset.cli.prepare_all            # --dry-run でpreflightのみ / --start-at/--stop-after/--force-stage
+# データセット全再作成（全ステージ再開可能・キャッシュ済みは自動スキップ）
+python -m dataset.cli.prepare_all           # --dry-run / --start-at / --stop-after / --force-stage
 # 学習（resume自動判別コマンドは train/configs/train_command_windows.txt）
 python -m train.cli.train --config train\configs\train_500m_v3_full.yaml --manifest dataset\data\manifests\train.jsonl --output-dir outputs\... --device cuda
 # チェックポイント→safetensors（EMA重みを使うなら --use-ema 必須）
 python -m inference.cli.convert_checkpoint <ckpt.pt> --use-ema
 ```
 
-## データパイプライン（dataset/）
+## データパイプライン（dataset/ — 6ステージ、完全ローカル）
 
-**クラウドSTTは使わない**（Grok STTは全廃済み）。`prepare_all.py` が全ステージをfingerprint付きで統括し、`dataset/data/pipeline/`（work dir）に再開可能な状態を持つ。ログ: `dataset/data/pipeline/full_pipeline/logs/`。
+クラウドSTT・音響分類器は無い。**Grok CLIはLLMとしてテキスト校正+分類にのみ**使う（`~/.grok` にサブスクログイン済みであること。モデルは grok-4.5 にピン留め）。オーケストレータは `prepare_all.py`、work dirは `dataset/data/pipeline/`、ログは `full_pipeline/logs/`、実行ログ `run.log`。
 
-1. **speech** (`speech_pipeline.py` / `prepare_speech`): ソース走査 → Silero VAD → 発話を**5〜20秒**にパック → FLACクリップ + `all.jsonl`（この時点で text は空）。VAD結果は `vad_responses/*.json` にキャッシュされ、nonverbal側も同じファイルを読む
-2. **nonverbal**: `acoustic_segmentation.py`（VAD外領域の自然区切り）→ BEATs埋め込み → `ero_voice_classifier.py`（aegi/chupa分類、pyannote動的import）
-3. **anime_whisper ステージ**: 実体は faster-whisper（`local_asr.FasterWhisperTranscriber`、反復抑制: repetition_penalty 1.1 + compression_ratio 2.4 + condition_on_previous_text=False）。speech/nonverbal両方を文字起こしし、`--shard-index/--shard-count` でGPU台数分のプロセスに分割→ID順マージ。speechは `--replace-text` で text を確定
-4. **context_correction** (`transcript_correction.py`): Grok CLI（LLMとしてのみ使用可。codex/claudeもフォールバック可）が同一音源タイムライン文脈で校正+**カテゴリ分類**（speech/aegi/chupa/mixed/other）。`other` は review 行きで学習除外。安全ゲート（類似度・長さ比）を通らない修正は棄却
-5. **manifests → latents → publish**: text は**発話内容のみ**（`喘ぎ声。…ラベルc0000。` 形式は廃止）。分類は `category` / `cluster_token` の別フィールドで `prepare_manifest`（DACVAEエンコード、マルチGPU対応）を通って最終 `dataset/data/manifests/train.jsonl` まで保持される
+1. **speech** (`speech_pipeline.py`): Silero VAD → 発話を**5〜20秒**にパック → FLACクリップ + `all.jsonl`（text空）。動的プロセスプール24並列（CPUバウンド）。VAD結果は `vad_responses/*.json` にキャッシュ（キーに `speech_pad_ms` 等のVAD設定を含む — nonverbal側と**同一設定必須**）
+2. **nonverbal** (`nonverbal_pipeline.py`): VADが拾わなかったギャップ（≥5秒）を `acoustic_segmentation.py` の自然境界で切り、無音除去して5〜20秒イベントクリップ化。行形式はspeechと同一（`origin: vad_complement`）。囁き・喘ぎ・フェラ音がここから回収される
+3. **anime_whisper**: speech+nonverbalを1本に連結（`all_clips.jsonl`）し、faster-whisper + `TransWithAI/whisper-ja-1.5B-ct2` で文字起こし。**CT2直叩きのクロスクリップバッチ推論**（`local_asr.FasterWhisperTranscriber`、反復抑制: repetition_penalty 1.1 + condition_on_previous_text=False）。GPUあたり2ワーカー×バッチ16をシャード分割（`--shard-index/count`）→ID順マージ
+4. **context_correction** (`transcript_correction.py`): Grok-4.5が同一音源タイムライン文脈で校正+**カテゴリ分類**。`category ∈ {speech, aegi, chupa, mixed, other}` が唯一のラベル権威。`other`（ノイズ）はreview行き。安全ゲート（類似度・長さ比）を通らない修正は棄却。バッチ結果は `text_correction/` にキャッシュ。並列128が実績上限（**256はgrok CLIがタイムアウト連鎖で崩壊**、timeout 600s）。出力は `all_corrected.jsonl` / `train.jsonl` / `review.jsonl`（入力の`all.jsonl`は上書きしない）
+5. **latents**: `prepare_manifest` がDACVAEエンコード（2GPU分散、`category`/`cluster_token` フィールドをパススルー）
+6. **publish**: `manifest_merge.py` で検証（latent重複・ID重複・実在）→ `dataset/data/manifests/train.jsonl` へ原子的置換（旧版は `train_before_full_*` にバックアップ）
 
 ### 重要な不変条件
 
-- 最終train.jsonlの行: `text` / `latent_path` / `num_frames`(25fps) / `speaker_id` / `id` / `source_uid` / `category` / `cluster_token`
-- クリップは content-addressed（idにstart/end ms埋め込み）で再実行時に再利用。キャッシュ類（VAD/ASR/校正）はモデル・設定のメタデータでキーされ、変更時に自動無効化
-- nonverbalイベントの適格レンジも5〜20秒（`nonverbal_training_manifest.py` と `acoustic_segmentation.py` の上限を揃えること）
-- LLM分類がnonverbalで `speech`/`other` を返した行、文字起こし不能行（`missing_transcript`）は review へ。空textの行を学習マニフェストに入れない（latent段の行数検証が壊れる）
+- 最終train.jsonl行: `text`（発話内容のみ、ラッパー無し）/ `latent_path` / `num_frames`(25fps) / `speaker_id` / `id` / `source_uid` / `category`
+- クリップはcontent-addressed（idにstart/end ms）、各キャッシュ（VAD/ASR/校正）はモデル・設定メタデータがキー — 設定変更で自動無効化、再実行は差分のみ
+- 空textの行を学習マニフェストに入れない（latentステージの行数検証が落ちる）。ASR不能行は `aw_transcript_unusable` でreview行き
+- 学習側 `max_latent_steps: 750`（=30秒）に対しデータは20秒上限なので切り詰めは発生しない設計
+
+### 長時間実行の運用
+
+- パイプラインは `Start-Process` でデタッチ起動する（Claude Code終了の巻き添えで死んだ実績あり）。落ちても再起動すればキャッシュから続行
+- mpg123の `dequantization failed` / id3警告はソースmp3の壊れフレームに対する無害ログ。監視フィルタから除外すること
 
 ## 学習・推論（train/ core/ inference/）
 
-- `core/`: モデル本体（RF/DiT、DACVAEコーデックラッパ、tokenizer、LoRA、watermark）
-- 学習設定は `train/configs/train_500m_v3_full.yaml`。`max_latent_steps: 750`（=30秒）を超える行はlatentだけ切り詰められてtext不一致になるため、データ側で20秒上限を守る
-- EMA有効（`ema_device: cpu` でVRAM消費なし、update毎10step）。**推論品質はEMA重み前提**なので、エクスポート時の `--use-ema` を忘れない
-- 学習マニフェスト差し替え時は `train.jsonl.irodori_index.pt`（loaderのインデックスキャッシュ）が自動再構築される
+- `core/`: モデル本体（RF/DiT、DACVAEラッパ、tokenizer、LoRA、watermark）
+- EMA有効（`ema_device: cpu`）。**推論品質はEMA重み前提** — エクスポート時 `--use-ema` を忘れない
+- `category` は現状マニフェスト保存のみで学習条件には未使用。条件付けに使うならtrain側の対応が別途必要
+- マニフェスト差し替え時は `train.jsonl.irodori_index.pt`（loaderインデックス）が自動再構築される
