@@ -203,12 +203,10 @@ class LatentTextDataset(Dataset):
                 if self.manifest_index.num_frames[sample_index] > self.max_latent_steps
             )
 
-    def category_sample_weights(self) -> tuple[list[float], dict[str, int]]:
-        """Per-sample weights that equalize category draw probability.
+    def sample_categories(self) -> tuple[list[str], dict[str, int]]:
+        """Per-sample category labels aligned with local indices.
 
-        weight = 1 / count(category), so each category contributes the same
-        total probability mass regardless of its sample count. Returns
-        (weights aligned with local indices, category counts).
+        Returns (categories, category counts) for group-balanced sampling.
         """
         counts: dict[str, int] = {}
         sample_categories: list[str] = []
@@ -216,8 +214,7 @@ class LatentTextDataset(Dataset):
             category = self.manifest_index.categories[sample_index] or "__none__"
             sample_categories.append(category)
             counts[category] = counts.get(category, 0) + 1
-        weights = [1.0 / counts[category] for category in sample_categories]
-        return weights, counts
+        return sample_categories, counts
 
     def __getstate__(self) -> dict[str, Any]:
         # Open file handles cannot cross process boundaries (Windows spawn

@@ -28,7 +28,7 @@ class LengthGroupedBatchSampler(Sampler[list[int]]):
         bucket_mult: int = 64,
         num_replicas: int = 1,
         rank: int = 0,
-        weights: list[float] | None = None,
+        groups: list[str] | None = None,
     ) -> None:
         if not lengths:
             raise ValueError("lengths must contain at least one sample length.")
@@ -48,25 +48,34 @@ class LengthGroupedBatchSampler(Sampler[list[int]]):
         self.bucket_mult = int(bucket_mult)
         self.num_replicas = int(num_replicas)
         self.rank = int(rank)
-        self.weights: torch.Tensor | None = None
-        if weights is not None:
-            if len(weights) != len(self.lengths):
+        # Category-balanced undersampling: each epoch every group contributes
+        # min(group sizes) samples drawn without replacement, so the epoch is
+        # num_groups * min_size and all groups are equally represented.
+        self.group_to_indices: dict[str, list[int]] | None = None
+        if groups is not None:
+            if len(groups) != len(self.lengths):
                 raise ValueError(
-                    f"weights length {len(weights)} != lengths length {len(self.lengths)}"
+                    f"groups length {len(groups)} != lengths length {len(self.lengths)}"
                 )
-            weight_tensor = torch.tensor(weights, dtype=torch.double)
-            if not torch.all(weight_tensor > 0):
-                raise ValueError("weights must all be > 0")
             if not shuffle:
-                raise ValueError("weighted sampling requires shuffle=True")
-            self.weights = weight_tensor
+                raise ValueError("group-balanced sampling requires shuffle=True")
+            group_to_indices: dict[str, list[int]] = {}
+            for index, group in enumerate(groups):
+                group_to_indices.setdefault(str(group), []).append(index)
+            self.group_to_indices = group_to_indices
         self.epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
+    def _epoch_size(self) -> int:
+        if self.group_to_indices is not None:
+            min_size = min(len(v) for v in self.group_to_indices.values())
+            return min_size * len(self.group_to_indices)
+        return len(self.lengths)
+
     def _shard_size(self) -> int:
-        n = len(self.lengths)
+        n = self._epoch_size()
         if self.drop_last:
             return n // self.num_replicas
         return (n + self.num_replicas - 1) // self.num_replicas
@@ -78,19 +87,23 @@ class LengthGroupedBatchSampler(Sampler[list[int]]):
         return (per_replica + self.batch_size - 1) // self.batch_size
 
     def __iter__(self) -> Iterator[list[int]]:
-        n = len(self.lengths)
         generator = torch.Generator()
         generator.manual_seed(self.seed + self.epoch)
-        if self.weights is not None:
-            # Weighted resampling with replacement: epoch size stays n, but
-            # each draw follows the (e.g. category-balancing) weights.
-            order = torch.multinomial(
-                self.weights, n, replacement=True, generator=generator
-            ).tolist()
+        if self.group_to_indices is not None:
+            # Undersample every group to the smallest group's size, without
+            # replacement, with a fresh random subset each epoch.
+            min_size = min(len(v) for v in self.group_to_indices.values())
+            order = []
+            for _, indices in sorted(self.group_to_indices.items()):
+                perm = torch.randperm(len(indices), generator=generator).tolist()
+                order.extend(indices[i] for i in perm[:min_size])
+            shuffle_order = torch.randperm(len(order), generator=generator).tolist()
+            order = [order[i] for i in shuffle_order]
         elif self.shuffle:
-            order = torch.randperm(n, generator=generator).tolist()
+            order = torch.randperm(len(self.lengths), generator=generator).tolist()
         else:
-            order = list(range(n))
+            order = list(range(len(self.lengths)))
+        n = len(order)
 
         if self.num_replicas > 1:
             per_replica = self._shard_size()

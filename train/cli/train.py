@@ -2515,11 +2515,11 @@ def main() -> None:
     train_batch_sampler = None
     use_length_bucketing = bool(train_cfg.length_bucketing) and train_cfg.batch_size > 1
     use_category_balancing = bool(train_cfg.category_balancing)
-    category_weights: list[float] | None = None
+    sample_categories: list[str] | None = None
     if use_category_balancing:
-        category_weights, category_counts = train_dataset.category_sample_weights()
+        sample_categories, category_counts = train_dataset.sample_categories()
         if len(category_counts) <= 1:
-            category_weights = None
+            sample_categories = None
             use_category_balancing = False
             if is_main_process:
                 print(
@@ -2527,9 +2527,14 @@ def main() -> None:
                     f"category: {sorted(category_counts)}"
                 )
         elif is_main_process:
+            min_count = min(category_counts.values())
+            print("Category-balanced sampling enabled (undersample to smallest category):")
+            print(f"  {'category':<10}{'rows':>8}{'used/epoch':>12}")
+            for name, count in sorted(category_counts.items()):
+                print(f"  {name:<10}{count:>8}{min_count:>12}")
             print(
-                "Category-balanced sampling enabled (equal draw probability, "
-                f"with replacement): {dict(sorted(category_counts.items()))}"
+                f"  {'total':<10}{len(train_dataset):>8}"
+                f"{min_count * len(category_counts):>12}"
             )
     if use_length_bucketing or use_category_balancing:
         train_batch_sampler = LengthGroupedBatchSampler(
@@ -2541,7 +2546,7 @@ def main() -> None:
             bucket_mult=train_cfg.length_bucket_mult if use_length_bucketing else 1,
             num_replicas=world_size if distributed else 1,
             rank=rank if distributed else 0,
-            weights=category_weights,
+            groups=sample_categories,
         )
         if is_main_process and use_length_bucketing:
             print(

@@ -50,5 +50,12 @@ python -m inference.cli.convert_checkpoint <ckpt.pt> --use-ema
 
 - `core/`: モデル本体（RF/DiT、DACVAEラッパ、tokenizer、LoRA、watermark）
 - EMA有効（`ema_device: cpu`）。**推論品質はEMA重み前提** — エクスポート時 `--use-ema` を忘れない
-- `category` は現状マニフェスト保存のみで学習条件には未使用。条件付けに使うならtrain側の対応が別途必要
-- マニフェスト差し替え時は `train.jsonl.irodori_index.pt`（loaderインデックス）が自動再構築される
+- 学習configは `train/configs/train_500m_v3_full.yaml` の一本のみ（起動コマンドは `train_command_windows.txt`）。valid分割なし（`valid_ratio: 0`）、毎epochサンプル推論
+- マニフェスト差し替え時は `train.jsonl.irodori_index.pt`（loaderインデックス）が自動再構築される（キャッシュキーにバージョン番号 `_MANIFEST_INDEX_CACHE_VERSION` — indexへのフィールド追加時は必ずインクリメント）
+
+### category を使った学習時サンプリング（train/dataset.py + train/sampler.py）
+
+- **参照音声（speaker条件のref latent）は「同一speaker＋同一category」の別クリップから毎回ランダム選択**。自分自身は絶対に参照しない。同カテゴリに他候補が無い行はspeakerフォールバックせず**Dataset構築時に学習対象から除外**（`style_filtered_count`、マニフェスト自体は不変更）
+- **カテゴリ均等サンプリング**（`category_balancing: true` デフォルト）: 毎epoch、各カテゴリから最小カテゴリ件数を非復元でランダム抽出（アンダーサンプリング）。1epoch = 最小カテゴリ件数×カテゴリ数で、epochごとにサブセットが入れ替わる。refプールは**除外前でなくロード済み全サンプル**から構築されるため、この間引きでrefフォールバックは発生しない
+- 1epochが実データより大幅に短くなるので `save_every_epochs` / `sample_every_epochs` の実質頻度に注意
+- `sample_training_checkpoint.py`（epoch毎サンプル推論）もテキストのカテゴリに一致するrefクリップを作品ごとに選ぶ（無ければspeechにフォールバック、`metadata.json` の `reference_category` に記録）
