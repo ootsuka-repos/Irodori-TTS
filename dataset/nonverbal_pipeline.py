@@ -208,6 +208,8 @@ def process_source(
                         end=end,
                         rebuild=rebuild_clips,
                         tail_pad_seconds=segmentation_config.tail_pad_silence_seconds,
+                        fade_in_seconds=segmentation_config.fade_in_seconds,
+                        fade_out_seconds=segmentation_config.fade_out_seconds,
                     )
                 except (OSError, RuntimeError, ValueError) as exc:
                     errors.append(

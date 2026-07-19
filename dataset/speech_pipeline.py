@@ -1,4 +1,4 @@
-"""Local speech clip pipeline: Silero VAD segmentation without any cloud STT.
+﻿"""Local speech clip pipeline: Silero VAD segmentation without any cloud STT.
 
 Replaces the former Grok STT module. Sources are scanned, Silero VAD detects
 speech, nearby utterances are packed into 5-20 s clips, and FLAC clips plus
@@ -133,6 +133,11 @@ class SpeechSegmentationConfig:
     tail_silence_hold_seconds: float = 0.20
     # Fixed digital silence appended to every written clip.
     tail_pad_silence_seconds: float = 0.5
+    # Perceptual edge fades so clip boundaries never sound abruptly cut.
+    # The fade-out is longer than the fade-in because trailing breath/decay
+    # cut mid-energy is what reads as a hard chop.
+    fade_in_seconds: float = 0.1
+    fade_out_seconds: float = 0.8
 
     def validate(self) -> None:
         if self.min_seconds <= 0 or self.max_seconds <= self.min_seconds:
@@ -143,6 +148,8 @@ class SpeechSegmentationConfig:
             raise ValueError("tail settings must be non-negative")
         if self.tail_silence_hold_seconds <= 0:
             raise ValueError("tail_silence_hold_seconds must be positive")
+        if self.fade_in_seconds < 0 or self.fade_out_seconds < 0:
+            raise ValueError("fade_in_seconds/fade_out_seconds must be non-negative")
 
     @property
     def max_span_seconds(self) -> float:
@@ -421,14 +428,32 @@ def _audio_stats(mono: np.ndarray) -> AudioStats:
     )
 
 
-def _apply_edge_fades(mono: np.ndarray, sample_rate: int, *, fade_seconds: float = 0.003) -> None:
-    """Apply short in-place linear fades so cut boundaries do not click."""
-    fade = min(int(round(sample_rate * fade_seconds)), int(mono.size) // 2)
-    if fade <= 0:
-        return
-    ramp = np.linspace(0.0, 1.0, fade, endpoint=False, dtype=np.float32)
-    mono[:fade] *= ramp
-    mono[-fade:] *= ramp[::-1]
+def _cosine_ramp(length: int) -> np.ndarray:
+    """Raised-cosine 0->1 ramp; smoother at the endpoints than a linear fade."""
+    phase = np.linspace(0.0, np.pi, length, endpoint=False, dtype=np.float64)
+    return (0.5 - 0.5 * np.cos(phase)).astype(np.float32)
+
+
+def _apply_edge_fades(
+    mono: np.ndarray,
+    sample_rate: int,
+    *,
+    fade_in_seconds: float = 0.1,
+    fade_out_seconds: float = 0.8,
+) -> None:
+    """Apply in-place cosine edge fades so cut boundaries do not sound chopped.
+
+    The two edges are faded independently: a short fade-in keeps consonant
+    attacks intact while the longer fade-out lands trailing breath/decay softly
+    instead of cutting it mid-energy. Both are clamped so they never overlap.
+    """
+    half = int(mono.size) // 2
+    fade_in = min(int(round(sample_rate * fade_in_seconds)), half)
+    fade_out = min(int(round(sample_rate * fade_out_seconds)), half)
+    if fade_in > 0:
+        mono[:fade_in] *= _cosine_ramp(fade_in)
+    if fade_out > 0:
+        mono[-fade_out:] *= _cosine_ramp(fade_out)[::-1]
 
 
 def _frame_rms(mono: np.ndarray, frame: int) -> np.ndarray:
@@ -529,6 +554,8 @@ def extract_clip(
     end: float,
     rebuild: bool = False,
     tail_pad_seconds: float = 0.0,
+    fade_in_seconds: float = 0.1,
+    fade_out_seconds: float = 0.8,
 ) -> AudioStats:
     """Read a range, downmix, fade the edges, and write mono FLAC."""
     sample_rate = int(reader.samplerate)
@@ -560,7 +587,12 @@ def extract_clip(
         raise ValueError("Decoded clip is empty or contains non-finite samples")
 
     mono = np.mean(audio, axis=1, dtype=np.float32)
-    _apply_edge_fades(mono, sample_rate)
+    _apply_edge_fades(
+        mono,
+        sample_rate,
+        fade_in_seconds=fade_in_seconds,
+        fade_out_seconds=fade_out_seconds,
+    )
     if pad_frames:
         mono = np.concatenate([mono, np.zeros(pad_frames, dtype=np.float32)])
     stats = _audio_stats(mono)
@@ -687,6 +719,8 @@ def _process_one_source(
                         end=segment.end,
                         rebuild=rebuild_clips,
                         tail_pad_seconds=segmentation_config.tail_pad_silence_seconds,
+                        fade_in_seconds=segmentation_config.fade_in_seconds,
+                        fade_out_seconds=segmentation_config.fade_out_seconds,
                     )
                 except (OSError, RuntimeError, ValueError) as exc:
                     errors.append(

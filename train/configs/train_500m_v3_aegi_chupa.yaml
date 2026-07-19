@@ -1,0 +1,120 @@
+# Aratako/Irodori-TTS-500M-v3 full fine-tuning on GPU1, aegi+chupa rows only
+# (dataset\data\manifests\train_aegi_chupa.jsonl, ~2.5k rows).
+model:
+  latent_dim: 32
+  latent_patch_size: 1
+  text_vocab_size: 99574
+  text_tokenizer_repo: llm-jp/llm-jp-3-150m
+  model_dim: 1280
+  num_layers: 12
+  num_heads: 20
+  mlp_ratio: 2.875
+  text_mlp_ratio: 2.6
+  speaker_mlp_ratio: 2.6
+  text_dim: 512
+  text_layers: 10
+  text_heads: 8
+  speaker_dim: 768
+  speaker_layers: 8
+  speaker_heads: 12
+  speaker_patch_size: 1
+  timestep_embed_dim: 512
+  adaln_rank: 192
+  use_duration_predictor: true
+  duration_aux_dim: 14
+  duration_hidden_dim: 1024
+  duration_layers: 3
+  duration_dropout: 0.1
+  duration_attention_heads: 8
+  duration_architecture: token_sum_adarn_zero_no_aux
+  duration_token_init_frames: 9.0
+  duration_speaker_fusion: adarn_zero
+
+train:
+  train_mode: rf
+  # 1x4 accum -> 4x1: same effective batch 4 and same optimizer steps per
+  # epoch, but one batched fwd/bwd instead of four tiny ones. Length bucketing
+  # keeps padding waste near zero, and stratified timestep sampling actually
+  # stratifies at batch>1.
+  batch_size: 4
+  gradient_accumulation_steps: 1
+  length_bucketing: true
+  length_bucket_mult: 64
+  # Was implicitly 750/full-mask (TrainConfig defaults): every sample was
+  # padded to 30s and self-attention saw a pure-noise tail that never exists at
+  # inference (variable-length generation). Train on real lengths instead:
+  # ~1.9x less latent compute (mean 385 vs 750 frames) and closer to inference.
+  fixed_target_latent_steps: null
+  fixed_target_full_mask: false
+  # Peak allocated ~9 GiB without checkpointing at batch 4 (16 GiB card);
+  # re-enable if OOM appears alongside the sampling subprocess.
+  gradient_checkpointing: false
+  data_parallel: false
+  # 52c CPU: feed the GPU faster
+  num_workers: 6
+  dataloader_persistent_workers: true
+  dataloader_prefetch_factor: 4
+  allow_tf32: true
+  compile_model: false
+  precision: bf16
+  # adamw8bit -> muon: orthogonalized updates on hidden matrices converge
+  # faster per step; embeddings/norms/output heads stay on AdamW. On resume
+  # from an adamw8bit checkpoint the stored optimizer state is incompatible;
+  # training warns and restarts moments (brief transient, weights are kept).
+  optimizer: muon
+  # match_rms_adamw keeps AdamW-scale LR valid for the Muon groups.
+  muon_adjust_lr_fn: match_rms_adamw
+  # 5e-5 -> 8e-5: faster domain fit after early epochs; resume rebases base LR.
+  learning_rate: 0.00008
+  # 0.01 -> 0.001: less L2 drag so weights can move further on this dataset.
+  weight_decay: 0.001
+  lr_scheduler: wsd
+  warmup_steps: 1000
+  stable_steps: 900000
+  min_lr_scale: 0.01
+  max_steps: 1000000
+  max_text_len: 256
+  # 0.0 -> 0.05: inference CFG (text scale 3 / speaker scale 5) extrapolates
+  # against the UNconditional prediction on every reference-conditioned
+  # generation, and the dataset has no naturally speaker-less rows. Without
+  # dropout the uncond path never trains and CFG quality decays as the
+  # finetune diverges from the base model.
+  text_condition_dropout: 0.05
+  speaker_condition_dropout: 0.05
+  timestep_stratified: true
+  max_latent_steps: 750
+  rf_loss_mode: utterance_mean
+  duration_loss_weight: 0.1
+  duration_speaker_dropout: 0.0
+  duration_huber_delta: 0.1
+  log_every: 25
+  ema_enabled: true
+  # 0.9995 -> 0.999: EMA tracks the new weights faster.
+  ema_decay: 0.999
+  # update_every only changes wall-clock cost, not the EMA trajectory
+  # (decay is compensated as decay^N); 10 halves the GPU->CPU sync traffic.
+  ema_update_every: 10
+  ema_device: cpu
+  tensorboard_enabled: true
+  tensorboard_log_dir: tensorboard
+  tensorboard_launch: true
+  tensorboard_port: 6007
+  save_every: 0
+  # Less I/O stall (each .pt is ~5GB)
+  save_every_epochs: 2
+  checkpoint_latest_n: 3
+  checkpoint_best_n: 2
+  # Less inference overhead between epochs
+  sample_every_epochs: 2
+  sample_cuda_visible_devices: "1"
+  sample_num_steps: 24
+  sample_seconds: null
+  sample_seed: 20260715
+  sample_reference_count: 3
+  valid_ratio: 0.01
+  # 2000 -> 4000: more steps spent training vs validating
+  valid_every: 4000
+  valid_split_by: speaker
+  lora_enabled: false
+  wandb_enabled: false
+  seed: 0

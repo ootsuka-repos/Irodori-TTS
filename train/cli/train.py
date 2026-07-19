@@ -1547,6 +1547,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--category-balancing",
+        dest="category_balancing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Resample training data with replacement so every category "
+            "(speech/mixed/aegi/chupa) is drawn with equal probability."
+        ),
+    )
+    parser.add_argument(
         "--prefetch-to-device",
         dest="dataloader_prefetch_to_device",
         action=argparse.BooleanOptionalAction,
@@ -1928,6 +1938,7 @@ def main() -> None:
         ("compile_model", args.compile_model),
         ("gradient_checkpointing", args.gradient_checkpointing),
         ("length_bucketing", args.length_bucketing),
+        ("category_balancing", args.category_balancing),
         ("dataloader_prefetch_to_device", args.dataloader_prefetch_to_device),
         ("caption_warmup", args.caption_warmup),
         ("speaker_inversion_enabled", args.speaker_inversion_enabled),
@@ -2397,6 +2408,12 @@ def main() -> None:
         manifest_progress_desc="Index Manifest",
         load_target_latent=dataset_load_target_latent,
     )
+    if is_main_process and full_dataset.style_filtered_count > 0:
+        print(
+            f"info: {full_dataset.style_filtered_count} manifest rows excluded from "
+            "training because their (speaker, category) pool has no alternative "
+            "clip for a style-matched reference (manifest untouched)."
+        )
     if is_main_process and full_dataset.overlong_sample_count > 0:
         print(
             f"warning: {full_dataset.overlong_sample_count} manifest rows declare "
@@ -2409,13 +2426,20 @@ def main() -> None:
     if train_cfg.valid_ratio > 0.0:
         split_groups = None
         if train_cfg.valid_split_by == "speaker":
-            split_groups = full_dataset.manifest_index.speaker_ids
+            split_groups = [
+                full_dataset.manifest_index.speaker_ids[i]
+                for i in full_dataset.sample_indices
+            ]
         train_indices, valid_indices = split_train_valid_indices(
             num_samples=len(full_dataset),
             valid_ratio=train_cfg.valid_ratio,
             seed=train_cfg.seed,
             groups=split_groups,
         )
+        # split indices are positions within the (possibly style-filtered)
+        # full_dataset; map them back to manifest row indices for subsetting.
+        train_indices = [full_dataset.sample_indices[i] for i in train_indices]
+        valid_indices = [full_dataset.sample_indices[i] for i in valid_indices]
         train_dataset = LatentTextDataset(
             manifest_path=train_cfg.manifest_path,
             latent_dim=model_cfg.latent_dim,
