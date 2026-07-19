@@ -36,6 +36,7 @@ python -m inference.cli.convert_checkpoint <ckpt.pt> --use-ema
 ### 重要な不変条件
 
 - 最終train.jsonl行: `text`（発話内容のみ、ラッパー無し）/ `latent_path` / `num_frames`(25fps) / `speaker_id` / `id` / `source_uid` / `category`
+- `speaker_id` は**RJ作品単位**（publish時に `RJ\d+` へ正規化。1作品=1CV前提。RJコードが無いソースはファイル単位IDのまま）。中間成果物はファイル単位IDを保持 — publish以外で正規化するとキャッシュ連鎖でlatent全再エンコードになるため触らない
 - クリップはcontent-addressed（idにstart/end ms）、各キャッシュ（VAD/ASR/校正）はモデル・設定メタデータがキー — 設定変更で自動無効化、再実行は差分のみ
 - 空textの行を学習マニフェストに入れない（latentステージの行数検証が落ちる）。ASR不能行は `aw_transcript_unusable` でreview行き
 - 学習側 `max_latent_steps: 750`（=30秒）に対しデータは20秒上限なので切り詰めは発生しない設計

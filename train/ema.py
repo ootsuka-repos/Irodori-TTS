@@ -11,6 +11,11 @@ class ModelEMA:
     into the same architecture directly. Floating tensors are kept in fp32 on
     ``device`` (CPU by default so a 16 GB GPU pays no VRAM cost); non-floating
     tensors are mirrored verbatim.
+
+    For the common CUDA-model/CPU-shadow layout, updates stage all weights into
+    pinned host buffers with one batched async device-to-host copy and then run
+    a single fused ``_foreach_lerp_`` instead of a synchronous transfer per
+    tensor, which keeps the EMA cost far below one optimizer step.
     """
 
     def __init__(
@@ -39,20 +44,40 @@ class ModelEMA:
             if value.is_floating_point():
                 value = value.float()
             self.shadow[name] = value
+        self._float_names = [n for n, v in self.shadow.items() if v.is_floating_point()]
+        self._other_names = [n for n, v in self.shadow.items() if not v.is_floating_point()]
+        self._float_shadows = [self.shadow[n] for n in self._float_names]
+        self._staging: list[torch.Tensor] | None = None
 
     @torch.no_grad()
     def update(self, model: torch.nn.Module) -> None:
         d = self._effective_decay
         state = model.state_dict()
-        for name, shadow in self.shadow.items():
-            value = state[name].detach()
-            if shadow.is_floating_point():
-                shadow.mul_(d).add_(
-                    value.to(device=shadow.device, dtype=shadow.dtype),
-                    alpha=1.0 - d,
-                )
+        if self._float_names:
+            sources = [state[name].detach() for name in self._float_names]
+            use_staging = (
+                sources[0].device.type == "cuda"
+                and self._float_shadows[0].device.type == "cpu"
+            )
+            if use_staging:
+                if self._staging is None:
+                    self._staging = [
+                        torch.empty_like(shadow, pin_memory=True)
+                        for shadow in self._float_shadows
+                    ]
+                for staged, value in zip(self._staging, sources, strict=True):
+                    staged.copy_(value, non_blocking=True)
+                torch.cuda.synchronize(sources[0].device)
+                sources = self._staging
             else:
-                shadow.copy_(value.to(device=shadow.device))
+                sources = [
+                    value.to(device=shadow.device, dtype=shadow.dtype)
+                    for shadow, value in zip(self._float_shadows, sources, strict=True)
+                ]
+            torch._foreach_lerp_(self._float_shadows, sources, 1.0 - d)
+        for name in self._other_names:
+            shadow = self.shadow[name]
+            shadow.copy_(state[name].detach().to(device=shadow.device))
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         return dict(self.shadow)

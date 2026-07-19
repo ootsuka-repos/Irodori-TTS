@@ -154,9 +154,14 @@ def _partition_muon_params(
         if not p.requires_grad:
             continue
         # Muon is intended for hidden matrix-like weights.
-        # Keep embeddings/output heads/bias-like params on Adam.
+        # Keep embeddings/output heads/bias-like params on Adam. Norm gains can
+        # be 2D here (per-head RMSNorm weights) but are scales, not matrices,
+        # so orthogonalizing them would destroy their meaning.
         is_muon_candidate = (
-            p.ndim >= 2 and "embedding" not in name and not name.endswith("out_proj.weight")
+            p.ndim >= 2
+            and "embedding" not in name
+            and "norm" not in name.lower()
+            and not name.endswith("out_proj.weight")
         )
         has_decay = _use_weight_decay(name, p)
         if is_muon_candidate:

@@ -743,6 +743,12 @@ class PipelineRunner:
                 str(clips),
                 "--output",
                 str(temporary),
+                # Speaker identity is per RJ work (one work = one CV), while raw
+                # rows carry per-source-file ids. Normalizing at publish keeps
+                # every upstream stage cache valid; doing it at the source would
+                # change intermediate manifest hashes and force a full latent
+                # re-encode.
+                "--normalize-speaker-rj",
             ]
             self.run_command("publish", command)
             expected = _line_count(clips)

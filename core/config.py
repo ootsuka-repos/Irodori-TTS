@@ -124,6 +124,10 @@ class TrainConfig:
     manifest_path: str = ""
     output_dir: str = "outputs"
     batch_size: int = 8
+    # Group similarly-sized samples into the same batch to minimize padding
+    # compute. Only active for batch_size > 1.
+    length_bucketing: bool = True
+    length_bucket_mult: int = 64
     num_workers: int = 2
     dataloader_persistent_workers: bool = False
     dataloader_prefetch_factor: int = 2

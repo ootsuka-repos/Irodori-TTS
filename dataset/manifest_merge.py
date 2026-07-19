@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from dataset._io_utils import atomic_write_text
+
+# One DLsite work (RJ code) is voiced by one CV in this corpus, so the RJ code
+# is the true speaker unit. Raw pipeline rows carry per-source-file speaker ids
+# (namespace:RJxxx_track_hash); collapsing them here gives cross-track reference
+# sampling and leak-free speaker-grouped validation splits.
+_RJ_CODE_RE = re.compile(r"RJ\d+", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -20,6 +27,7 @@ class LatentManifestMergeResult:
     input_manifests: tuple[Path, ...]
     input_counts: tuple[int, ...]
     combined_count: int
+    speaker_normalized_count: int = 0
 
 
 def _jsonl_text(rows: Sequence[Mapping[str, Any]]) -> str:
@@ -45,17 +53,28 @@ def _read_jsonl_objects(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def normalize_speaker_id_to_work(speaker_id: str) -> str:
+    """Collapse a per-source-file speaker id to its RJ work code when present."""
+    match = _RJ_CODE_RE.search(speaker_id)
+    if match is None:
+        return speaker_id
+    return match.group(0).upper()
+
+
 def merge_latent_training_manifests(
     input_manifests: Sequence[str | Path],
     output_manifest: str | Path,
     *,
     require_latent_files: bool = True,
+    normalize_speaker_rj: bool = False,
 ) -> LatentManifestMergeResult:
     """Safely combine DACVAE latent manifests without changing their sources.
 
     Relative ``latent_path`` values are resolved from each source manifest and
     rewritten relative to the output manifest, so inputs from different
-    directories retain the same file meaning. All row metadata is preserved.
+    directories retain the same file meaning. All row metadata is preserved,
+    except that ``normalize_speaker_rj=True`` collapses ``speaker_id`` to its
+    RJ work code (rows without an RJ code keep their original id).
     """
     sources = tuple(Path(path).expanduser().resolve() for path in input_manifests)
     if not sources:
@@ -70,11 +89,19 @@ def merge_latent_training_manifests(
     input_counts: list[int] = []
     seen_latents: dict[str, str] = {}
     seen_ids: dict[str, str] = {}
+    speaker_normalized_count = 0
     for source in sources:
         rows = _read_jsonl_objects(source)
         input_counts.append(len(rows))
         for line_index, source_row in enumerate(rows, 1):
             row = dict(source_row)
+            if normalize_speaker_rj:
+                raw_speaker = row.get("speaker_id")
+                if raw_speaker is not None:
+                    normalized_speaker = normalize_speaker_id_to_work(str(raw_speaker))
+                    if normalized_speaker != raw_speaker:
+                        row["speaker_id"] = normalized_speaker
+                        speaker_normalized_count += 1
             raw_latent_path = str(row.get("latent_path") or "").strip()
             if not raw_latent_path:
                 raise ValueError(f"latent_path is missing at {source}:{line_index}")
@@ -131,4 +158,5 @@ def merge_latent_training_manifests(
         input_manifests=sources,
         input_counts=tuple(input_counts),
         combined_count=len(merged),
+        speaker_normalized_count=speaker_normalized_count,
     )

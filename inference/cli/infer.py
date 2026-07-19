@@ -345,6 +345,15 @@ def main() -> None:
             "Print per-stage timings from post-model-load through latent decode (default: enabled)."
         ),
     )
+    parser.add_argument(
+        "--use-ema",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Load 'ema_model' weights when the checkpoint is a training .pt "
+            "(matches the exported inference model). Ignored for .safetensors."
+        ),
+    )
     ref_group = parser.add_mutually_exclusive_group(required=False)
     ref_group.add_argument(
         "--ref-wav",
@@ -385,6 +394,7 @@ def main() -> None:
             codec_deterministic_decode=bool(args.codec_deterministic_decode),
             compile_model=bool(args.compile_model),
             compile_dynamic=bool(args.compile_dynamic),
+            use_ema=bool(args.use_ema),
         )
     )
     if runtime.model_cfg.use_speaker_condition_resolved and not (

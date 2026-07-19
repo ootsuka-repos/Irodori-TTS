@@ -74,6 +74,7 @@ from train.dataset import LatentTextDataset, TTSCollator
 from train.ema import ModelEMA
 from train.optim import build_optimizer, build_scheduler, current_lr
 from train.progress import TrainProgress
+from train.sampler import LengthGroupedBatchSampler
 
 WANDB_MODES = {"online", "offline", "disabled"}
 TRAIN_MODES = {"rf", "duration_only"}
@@ -331,6 +332,9 @@ def run_epoch_test_inference(
         str(train_cfg.sample_seed),
         "--reference-count",
         str(train_cfg.sample_reference_count),
+        # Comparison samples should mirror the exported inference model, which
+        # is converted from EMA weights whenever EMA is enabled.
+        "--use-ema" if train_cfg.ema_enabled else "--no-use-ema",
     ]
     if train_cfg.sample_seconds is not None:
         command.extend(("--seconds", str(train_cfg.sample_seconds)))
@@ -1533,6 +1537,16 @@ def main() -> None:
     )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument(
+        "--length-bucketing",
+        dest="length_bucketing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Group similar-length samples into the same batch to minimize padding "
+            "compute (only effective with batch_size > 1)."
+        ),
+    )
+    parser.add_argument(
         "--prefetch-to-device",
         dest="dataloader_prefetch_to_device",
         action=argparse.BooleanOptionalAction,
@@ -1913,6 +1927,7 @@ def main() -> None:
         ("allow_tf32", args.allow_tf32),
         ("compile_model", args.compile_model),
         ("gradient_checkpointing", args.gradient_checkpointing),
+        ("length_bucketing", args.length_bucketing),
         ("dataloader_prefetch_to_device", args.dataloader_prefetch_to_device),
         ("caption_warmup", args.caption_warmup),
         ("speaker_inversion_enabled", args.speaker_inversion_enabled),
@@ -1941,13 +1956,14 @@ def main() -> None:
     resume_path = Path(args.resume).expanduser() if args.resume is not None else None
     resume_train_cfg = None
     resume_base_init = None
+    resume_payload: dict | None = None
     if args.resume is not None:
-        resume_meta = _load_checkpoint_payload(resume_path, map_location="cpu")
-        raw_resume_train_cfg = resume_meta.get("train_config")
+        resume_payload = _load_checkpoint_payload(resume_path, map_location="cpu")
+        raw_resume_train_cfg = resume_payload.get("train_config")
         if raw_resume_train_cfg is not None and not isinstance(raw_resume_train_cfg, dict):
             raise ValueError("Resume checkpoint train_config must be a dictionary when present.")
         resume_train_cfg = raw_resume_train_cfg
-        raw_resume_base_init = resume_meta.get("base_init")
+        raw_resume_base_init = resume_payload.get("base_init")
         if raw_resume_base_init is not None and not isinstance(raw_resume_base_init, dict):
             raise ValueError("Resume checkpoint base_init must be a dictionary when present.")
         resume_base_init = raw_resume_base_init
@@ -2171,6 +2187,10 @@ def main() -> None:
     if train_cfg.dataloader_prefetch_factor <= 0:
         raise ValueError(
             f"dataloader_prefetch_factor must be > 0, got {train_cfg.dataloader_prefetch_factor}"
+        )
+    if train_cfg.length_bucket_mult <= 0:
+        raise ValueError(
+            f"length_bucket_mult must be > 0, got {train_cfg.length_bucket_mult}"
         )
     if not (0.0 <= train_cfg.valid_ratio < 1.0):
         raise ValueError(f"valid_ratio must be in [0, 1), got {train_cfg.valid_ratio}")
@@ -2468,7 +2488,25 @@ def main() -> None:
     if train_cfg.timestep_stratified and is_main_process:
         print("Using stratified logit-normal timestep sampling.")
     train_sampler = None
-    if distributed:
+    train_batch_sampler = None
+    use_length_bucketing = bool(train_cfg.length_bucketing) and train_cfg.batch_size > 1
+    if use_length_bucketing:
+        train_batch_sampler = LengthGroupedBatchSampler(
+            train_dataset.sample_lengths(),
+            batch_size=train_cfg.batch_size,
+            drop_last=drop_last,
+            shuffle=True,
+            seed=train_cfg.seed,
+            bucket_mult=train_cfg.length_bucket_mult,
+            num_replicas=world_size if distributed else 1,
+            rank=rank if distributed else 0,
+        )
+        if is_main_process:
+            print(
+                "Length-bucketed batching enabled: "
+                f"batch_size={train_cfg.batch_size} bucket_mult={train_cfg.length_bucket_mult}."
+            )
+    elif distributed:
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=world_size,
@@ -2477,7 +2515,6 @@ def main() -> None:
             drop_last=drop_last,
         )
     dataloader_common_kwargs = {
-        "batch_size": train_cfg.batch_size,
         "num_workers": train_cfg.num_workers,
         "pin_memory": (device.type == "cuda"),
         "collate_fn": collator,
@@ -2489,13 +2526,21 @@ def main() -> None:
         dataloader_common_kwargs["prefetch_factor"] = int(train_cfg.dataloader_prefetch_factor)
     elif train_cfg.dataloader_persistent_workers and is_main_process:
         print("warning: dataloader_persistent_workers=True is ignored because num_workers=0.")
-    loader = DataLoader(
-        dataset=train_dataset,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
-        drop_last=drop_last,
-        **dataloader_common_kwargs,
-    )
+    if train_batch_sampler is not None:
+        loader = DataLoader(
+            dataset=train_dataset,
+            batch_sampler=train_batch_sampler,
+            **dataloader_common_kwargs,
+        )
+    else:
+        loader = DataLoader(
+            dataset=train_dataset,
+            batch_size=train_cfg.batch_size,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            drop_last=drop_last,
+            **dataloader_common_kwargs,
+        )
     if len(loader) == 0:
         raise ValueError("Dataloader yielded zero batches. Check manifest and batch_size settings.")
     valid_loader = None
@@ -2511,6 +2556,7 @@ def main() -> None:
             )
         valid_loader = DataLoader(
             dataset=valid_dataset,
+            batch_size=train_cfg.batch_size,
             shuffle=False,
             sampler=valid_sampler,
             drop_last=False,
@@ -2752,21 +2798,61 @@ def main() -> None:
     ema: ModelEMA | None = None
     resume_ema_state = None
     if args.resume is not None:
-        ckpt = _load_checkpoint_payload(resume_path, map_location=device)
+        # Reuse the payload already loaded for config restore, and keep it on
+        # CPU: load_state_dict moves tensors to the parameter device, so the
+        # checkpoint copy never needs to occupy VRAM for the rest of the run.
+        ckpt = (
+            resume_payload
+            if resume_payload is not None
+            else _load_checkpoint_payload(resume_path, map_location="cpu")
+        )
+        resume_payload = None
         if not train_config_uses_lora(train_cfg):
             raw_model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except Exception as exc:
+            # A different optimizer choice (e.g. adamw8bit -> muon) makes the
+            # stored state unloadable; warn and continue with fresh moments.
+            if is_main_process:
+                print(
+                    "warning: optimizer state in the resume checkpoint is incompatible "
+                    f"with optimizer={train_cfg.optimizer!r}; continuing with fresh "
+                    f"optimizer state ({exc})."
+                )
         step = int(ckpt["step"])
         start_epoch = int(ckpt.get("epoch", 0))
         resume_ema_state = ckpt.get("ema_model")
+        resume_scheduler_state = ckpt.get("scheduler")
+        del ckpt
+        # Rebase LR / weight_decay from current yaml/CLI. Keep Adam moments + step.
+        # (load_state_dict restores old hyperparams from the checkpoint otherwise.)
+        new_base = float(train_cfg.learning_rate)
+        new_wd = float(train_cfg.weight_decay)
+        for group in optimizer.param_groups:
+            if float(group.get("weight_decay", 0.0)) > 0.0:
+                group["weight_decay"] = new_wd
         if scheduler is not None:
-            scheduler_state = ckpt.get("scheduler")
+            scheduler_state = resume_scheduler_state
             if scheduler_state is not None:
                 scheduler.load_state_dict(scheduler_state)
             elif step > 0:
                 scheduler.last_step = step
+            scheduler.base_lrs = [new_base for _ in scheduler.base_lrs]
+            scale = float(scheduler.lr_lambda(max(int(scheduler.last_step), 0)))
+            for base_lr, group in zip(
+                scheduler.base_lrs, optimizer.param_groups, strict=False
+            ):
+                group["lr"] = base_lr * scale
+        else:
+            for group in optimizer.param_groups:
+                group["lr"] = new_base
         if is_main_process:
-            print(f"Resumed from step={step} (epoch={start_epoch})")
+            print(
+                f"Resumed from step={step} (epoch={start_epoch}) "
+                f"lr={current_lr(optimizer):.3e} "
+                f"(base={new_base:.3e} weight_decay={new_wd:g})"
+            )
     if train_cfg.ema_enabled:
         ema = ModelEMA(
             raw_model,
@@ -2785,6 +2871,7 @@ def main() -> None:
                 f"EMA enabled: decay={train_cfg.ema_decay} "
                 f"update_every={train_cfg.ema_update_every} device={train_cfg.ema_device}"
             )
+    resume_ema_state = None
 
     progress = TrainProgress(
         max_steps=train_cfg.max_steps,
@@ -2833,6 +2920,8 @@ def main() -> None:
         while step < train_cfg.max_steps:
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
+            elif train_batch_sampler is not None:
+                train_batch_sampler.set_epoch(epoch)
             epoch += 1
             device_batches = iter_device_batches(
                 loader,
@@ -3517,6 +3606,9 @@ def main() -> None:
     finally:
         if progress is not None:
             progress.close()
+        if device.type == "cuda" and is_main_process:
+            peak_gib = torch.cuda.max_memory_allocated(device) / (1024**3)
+            print(f"Peak CUDA memory allocated: {peak_gib:.2f} GiB")
         if wandb_run is not None:
             wandb_run.finish()
         if tensorboard_writer is not None:

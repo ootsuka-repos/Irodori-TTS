@@ -204,6 +204,24 @@ class LatentTextDataset(Dataset):
     def __len__(self) -> int:
         return len(self.sample_indices)
 
+    def sample_lengths(self) -> list[int]:
+        """
+        Manifest-declared latent lengths aligned with __getitem__ indices.
+
+        Used for length-grouped batching; rows without a usable num_frames fall
+        back to max_latent_steps so unknown lengths group together.
+        """
+        fallback = int(self.max_latent_steps) if self.max_latent_steps is not None else 0
+        lengths: list[int] = []
+        for sample_index in self.sample_indices:
+            num_frames = int(self.manifest_index.num_frames[sample_index])
+            if num_frames < 0:
+                num_frames = fallback
+            elif self.max_latent_steps is not None:
+                num_frames = min(num_frames, int(self.max_latent_steps))
+            lengths.append(num_frames)
+        return lengths
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         item = self._read_item(index)
         latent: torch.Tensor | None = None

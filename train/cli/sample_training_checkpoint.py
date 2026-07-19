@@ -71,6 +71,15 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=20260715)
     parser.add_argument("--reference-count", type=int, default=3)
+    parser.add_argument(
+        "--use-ema",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Sample from the checkpoint's EMA weights (matches the exported "
+            "inference model). Falls back to raw weights when absent."
+        ),
+    )
     args = parser.parse_args()
 
     checkpoint = args.checkpoint.expanduser().resolve()
@@ -86,6 +95,7 @@ def main() -> None:
             model_precision="bf16",
             codec_device="cuda",
             codec_precision="bf16",
+            use_ema=bool(args.use_ema),
         )
     )
     generated: list[dict[str, object]] = []
@@ -129,6 +139,7 @@ def main() -> None:
         "reference_count": len(references),
         "num_steps": int(args.num_steps),
         "seconds": None if args.seconds is None else float(args.seconds),
+        "use_ema": bool(args.use_ema),
         "samples": generated,
     }
     (output_dir / "metadata.json").write_text(

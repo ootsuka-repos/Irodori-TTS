@@ -40,6 +40,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=True,
         help="Reject rows whose latent_path does not exist (enabled by default).",
     )
+    parser.add_argument(
+        "--normalize-speaker-rj",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Collapse per-source-file speaker_id values to their RJ work code "
+            "(one work = one voice). Rows without an RJ code keep their id. "
+            "Enabled by default."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -50,11 +60,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         inputs,
         args.output,
         require_latent_files=args.require_latent_files,
+        normalize_speaker_rj=args.normalize_speaker_rj,
     )
     counts = "+".join(str(count) for count in result.input_counts)
     print(
         f"complete inputs={len(result.input_manifests)} rows={counts} "
-        f"combined={result.combined_count} output={result.output_manifest}"
+        f"combined={result.combined_count} "
+        f"speaker_normalized={result.speaker_normalized_count} "
+        f"output={result.output_manifest}"
     )
 
 

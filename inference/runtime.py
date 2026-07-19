@@ -157,6 +157,9 @@ class RuntimeKey:
     codec_deterministic_decode: bool = True
     compile_model: bool = False
     compile_dynamic: bool = False
+    # Load 'ema_model' weights from training .pt checkpoints when available.
+    # Exported/inference checkpoints (.safetensors) are unaffected.
+    use_ema: bool = False
 
 
 @dataclass
@@ -330,6 +333,8 @@ _INFERENCE_CONFIG_KEYS = {
 
 def _load_checkpoint_from_pt(
     path: Path,
+    *,
+    use_ema: bool = False,
 ) -> tuple[dict[str, torch.Tensor], dict, dict | None]:
     ckpt = _load_torch_checkpoint_payload(path)
     model_state = ckpt.get("model")
@@ -338,6 +343,16 @@ def _load_checkpoint_from_pt(
 
     if not isinstance(model_state, dict):
         raise ValueError(f"Checkpoint missing model weights dictionary: {path}")
+    if use_ema:
+        ema_state = ckpt.get("ema_model")
+        if isinstance(ema_state, dict) and ema_state:
+            model_state = ema_state
+            print(f"info: using EMA weights from training checkpoint: {path.name}")
+        else:
+            print(
+                "warning: use_ema requested but checkpoint has no 'ema_model'; "
+                f"falling back to raw model weights: {path.name}"
+            )
     if not isinstance(model_cfg, dict):
         raise ValueError(f"Checkpoint missing model_config dictionary: {path}")
     if train_cfg is not None and not isinstance(train_cfg, dict):
@@ -423,10 +438,12 @@ def _load_checkpoint_from_safetensors(
 
 def _load_checkpoint_for_inference(
     path: Path,
+    *,
+    use_ema: bool = False,
 ) -> tuple[dict[str, torch.Tensor], dict, dict | None]:
     if path.suffix.lower() == ".safetensors":
         return _load_checkpoint_from_safetensors(path)
-    return _load_checkpoint_from_pt(path)
+    return _load_checkpoint_from_pt(path, use_ema=use_ema)
 
 
 class InferenceRuntime:
@@ -473,7 +490,8 @@ class InferenceRuntime:
         )
 
         model_state, model_cfg_dict, train_cfg = _load_checkpoint_for_inference(
-            Path(key.checkpoint)
+            Path(key.checkpoint),
+            use_ema=bool(key.use_ema),
         )
         model_cfg = ModelConfig(**model_cfg_dict)
 
