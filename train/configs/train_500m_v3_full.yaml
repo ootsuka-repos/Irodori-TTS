@@ -39,6 +39,10 @@ train:
   gradient_accumulation_steps: 1
   length_bucketing: true
   length_bucket_mult: 64
+  # Resample with replacement so speech/mixed/aegi/chupa are drawn with equal
+  # probability per epoch (epoch size unchanged). Replaces the old separate
+  # aegi+chupa run on a filtered manifest.
+  category_balancing: true
   # Was implicitly 750/full-mask (TrainConfig defaults): every sample was
   # padded to 30s and self-attention saw a pure-noise tail that never exists at
   # inference (variable-length generation). Train on real lengths instead:
@@ -103,17 +107,14 @@ train:
   save_every_epochs: 2
   checkpoint_latest_n: 3
   checkpoint_best_n: 2
-  # Less inference overhead between epochs
-  sample_every_epochs: 2
+  sample_every_epochs: 1
   sample_cuda_visible_devices: "0"
   sample_num_steps: 24
   sample_seconds: null
   sample_seed: 20260715
   sample_reference_count: 3
-  valid_ratio: 0.01
-  # 2000 -> 4000: more steps spent training vs validating
-  valid_every: 4000
-  valid_split_by: speaker
+  # No train/valid split: all manifest rows train.
+  valid_ratio: 0.0
   lora_enabled: false
   wandb_enabled: false
   seed: 0

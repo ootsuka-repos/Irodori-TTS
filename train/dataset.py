@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import json
 import os
 import random
@@ -16,7 +17,7 @@ from core.duration import build_duration_features
 from core.latents import patchify_latent
 from core.tokenizer import PretrainedTextTokenizer
 
-_MANIFEST_INDEX_CACHE_VERSION = 3
+_MANIFEST_INDEX_CACHE_VERSION = 4
 
 
 def _caption_candidates(raw: Any) -> list[str]:
@@ -138,7 +139,44 @@ class LatentTextDataset(Dataset):
                 )
             self.sample_indices = sorted(subset_index_set)
 
+        # Drop samples that cannot get a style-matched reference (their
+        # (speaker, category) pool has no alternative clip). Filtering happens
+        # at load time only — the manifest itself is untouched.
+        self.style_filtered_count = 0
+        if self.enable_speaker_condition:
+            pool_sizes: collections.Counter[tuple[str | None, str | None]] = (
+                collections.Counter(
+                    (
+                        self.manifest_index.speaker_ids[sample_index],
+                        self.manifest_index.categories[sample_index],
+                    )
+                    for sample_index in self.sample_indices
+                )
+            )
+            kept = [
+                sample_index
+                for sample_index in self.sample_indices
+                if self.manifest_index.speaker_ids[sample_index] is not None
+                and pool_sizes[
+                    (
+                        self.manifest_index.speaker_ids[sample_index],
+                        self.manifest_index.categories[sample_index],
+                    )
+                ]
+                >= 2
+            ]
+            self.style_filtered_count = len(self.sample_indices) - len(kept)
+            if not kept:
+                raise ValueError(
+                    "All samples were filtered out: no (speaker, category) pool "
+                    f"has at least 2 clips in {self.manifest_path}"
+                )
+            self.sample_indices = kept
+
         self.speaker_to_indices: dict[str, list[int]] = {}
+        # Style-matched reference pool: same speaker AND same category. Falls
+        # back to the speaker-wide pool when a category has no alternatives.
+        self.speaker_category_to_indices: dict[tuple[str, str | None], list[int]] = {}
         self.speaker_labeled_count = 0
         self.caption_labeled_count = 0
         for local_index, sample_index in enumerate(self.sample_indices):
@@ -147,6 +185,10 @@ class LatentTextDataset(Dataset):
                 self.speaker_labeled_count += 1
                 if self.enable_speaker_condition:
                     self.speaker_to_indices.setdefault(speaker_id, []).append(local_index)
+                    category = self.manifest_index.categories[sample_index]
+                    self.speaker_category_to_indices.setdefault(
+                        (speaker_id, category), []
+                    ).append(local_index)
             if self.manifest_index.has_caption[sample_index]:
                 self.caption_labeled_count += 1
 
@@ -160,6 +202,22 @@ class LatentTextDataset(Dataset):
                 for sample_index in self.sample_indices
                 if self.manifest_index.num_frames[sample_index] > self.max_latent_steps
             )
+
+    def category_sample_weights(self) -> tuple[list[float], dict[str, int]]:
+        """Per-sample weights that equalize category draw probability.
+
+        weight = 1 / count(category), so each category contributes the same
+        total probability mass regardless of its sample count. Returns
+        (weights aligned with local indices, category counts).
+        """
+        counts: dict[str, int] = {}
+        sample_categories: list[str] = []
+        for sample_index in self.sample_indices:
+            category = self.manifest_index.categories[sample_index] or "__none__"
+            sample_categories.append(category)
+            counts[category] = counts.get(category, 0) + 1
+        weights = [1.0 / counts[category] for category in sample_categories]
+        return weights, counts
 
     def __getstate__(self) -> dict[str, Any]:
         # Open file handles cannot cross process boundaries (Windows spawn
@@ -231,8 +289,16 @@ class LatentTextDataset(Dataset):
         ref_index = index
         has_speaker = False
         if self.enable_speaker_condition:
-            speaker_id = self.manifest_index.speaker_ids[self.sample_indices[index]]
-            candidates = self.speaker_to_indices.get(speaker_id, [])
+            sample_index = self.sample_indices[index]
+            speaker_id = self.manifest_index.speaker_ids[sample_index]
+            category = self.manifest_index.categories[sample_index]
+            # Prefer style-matched references (same speaker + same category) so
+            # the model learns to take prosody/style from the reference; fall
+            # back to any clip of the speaker when the category pool has no
+            # alternative clip.
+            candidates = self.speaker_category_to_indices.get((speaker_id, category), [])
+            if len(candidates) <= 1:
+                candidates = self.speaker_to_indices.get(speaker_id, [])
             if len(candidates) > 1:
                 # candidates are ordered local indices. Select uniformly from
                 # all positions except the current one without allocating an
@@ -286,6 +352,7 @@ class LatentTextDataset(Dataset):
 class _ManifestIndex:
     offsets: list[int]
     speaker_ids: list[str | None]
+    categories: list[str | None]
     has_caption: list[bool]
     # Manifest-declared frame counts (-1 when the line has no usable num_frames).
     num_frames: list[int]
@@ -324,6 +391,7 @@ class _ManifestIndex:
 
         offsets = payload.get("offsets")
         speaker_ids = payload.get("speaker_ids")
+        categories = payload.get("categories")
         has_caption = payload.get("has_caption")
         num_frames = payload.get("num_frames")
         if not isinstance(offsets, torch.Tensor) or offsets.ndim != 1:
@@ -332,17 +400,19 @@ class _ManifestIndex:
             return None
         if not isinstance(num_frames, torch.Tensor) or num_frames.ndim != 1:
             return None
-        if not isinstance(speaker_ids, list):
+        if not isinstance(speaker_ids, list) or not isinstance(categories, list):
             return None
         if (
             offsets.numel() != has_caption.numel()
             or offsets.numel() != num_frames.numel()
             or offsets.numel() != len(speaker_ids)
+            or offsets.numel() != len(categories)
         ):
             return None
         return _ManifestIndex(
             offsets=[int(x) for x in offsets.tolist()],
             speaker_ids=[None if x is None else str(x) for x in speaker_ids],
+            categories=[None if x is None else str(x) for x in categories],
             has_caption=[bool(x) for x in has_caption.tolist()],
             num_frames=[int(x) for x in num_frames.tolist()],
             caption_key=str(caption_key),
@@ -358,6 +428,7 @@ class _ManifestIndex:
             "caption_key": self.caption_key,
             "offsets": torch.tensor(self.offsets, dtype=torch.int64),
             "speaker_ids": self.speaker_ids,
+            "categories": self.categories,
             "has_caption": torch.tensor(self.has_caption, dtype=torch.bool),
             "num_frames": torch.tensor(self.num_frames, dtype=torch.int64),
         }
@@ -389,6 +460,7 @@ class _ManifestIndex:
 
         offsets: list[int] = []
         speaker_ids: list[str | None] = []
+        categories: list[str | None] = []
         has_caption: list[bool] = []
         num_frames: list[int] = []
         total_bytes = manifest_path.stat().st_size
@@ -421,6 +493,8 @@ class _ManifestIndex:
                     offsets.append(offset)
                     speaker_id = item.get("speaker_id")
                     speaker_ids.append(None if speaker_id is None else str(speaker_id))
+                    category = item.get("category")
+                    categories.append(None if category is None else str(category))
                     has_caption.append(_has_caption(item.get(caption_key)))
                     num_frames.append(_coerce_num_frames(item.get("num_frames")))
             finally:
@@ -430,6 +504,7 @@ class _ManifestIndex:
         index = cls(
             offsets=offsets,
             speaker_ids=speaker_ids,
+            categories=categories,
             has_caption=has_caption,
             num_frames=num_frames,
             caption_key=caption_key,

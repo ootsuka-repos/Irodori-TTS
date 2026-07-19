@@ -28,6 +28,7 @@ class LengthGroupedBatchSampler(Sampler[list[int]]):
         bucket_mult: int = 64,
         num_replicas: int = 1,
         rank: int = 0,
+        weights: list[float] | None = None,
     ) -> None:
         if not lengths:
             raise ValueError("lengths must contain at least one sample length.")
@@ -47,6 +48,18 @@ class LengthGroupedBatchSampler(Sampler[list[int]]):
         self.bucket_mult = int(bucket_mult)
         self.num_replicas = int(num_replicas)
         self.rank = int(rank)
+        self.weights: torch.Tensor | None = None
+        if weights is not None:
+            if len(weights) != len(self.lengths):
+                raise ValueError(
+                    f"weights length {len(weights)} != lengths length {len(self.lengths)}"
+                )
+            weight_tensor = torch.tensor(weights, dtype=torch.double)
+            if not torch.all(weight_tensor > 0):
+                raise ValueError("weights must all be > 0")
+            if not shuffle:
+                raise ValueError("weighted sampling requires shuffle=True")
+            self.weights = weight_tensor
         self.epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
@@ -68,7 +81,13 @@ class LengthGroupedBatchSampler(Sampler[list[int]]):
         n = len(self.lengths)
         generator = torch.Generator()
         generator.manual_seed(self.seed + self.epoch)
-        if self.shuffle:
+        if self.weights is not None:
+            # Weighted resampling with replacement: epoch size stays n, but
+            # each draw follows the (e.g. category-balancing) weights.
+            order = torch.multinomial(
+                self.weights, n, replacement=True, generator=generator
+            ).tolist()
+        elif self.shuffle:
             order = torch.randperm(n, generator=generator).tolist()
         else:
             order = list(range(n))

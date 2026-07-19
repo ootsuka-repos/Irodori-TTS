@@ -128,6 +128,10 @@ class TrainConfig:
     # compute. Only active for batch_size > 1.
     length_bucketing: bool = True
     length_bucket_mult: int = 64
+    # Resample training data so every category (speech/mixed/aegi/chupa) is
+    # drawn with equal probability per epoch (with replacement). Epoch size is
+    # unchanged; over-represented categories are seen less often per epoch.
+    category_balancing: bool = True
     num_workers: int = 2
     dataloader_persistent_workers: bool = False
     dataloader_prefetch_factor: int = 2
