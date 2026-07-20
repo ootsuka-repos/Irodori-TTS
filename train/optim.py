@@ -424,10 +424,18 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
     if opt_name in {"adamw", "adamw8bit"}:
         decay, no_decay = _partition_adamw_params(model)
         param_groups = []
+        # irodori_decay records each group's weight-decay intent so resume can
+        # tell decay from no-decay groups after optimizer.load_state_dict pins
+        # the live weight_decay values to the checkpoint's copies (see the
+        # resume rebase in train.cli.train). It rounds-trips through state_dict.
         if decay:
-            param_groups.append({"params": decay, "weight_decay": cfg.weight_decay})
+            param_groups.append(
+                {"params": decay, "weight_decay": cfg.weight_decay, "irodori_decay": True}
+            )
         if no_decay:
-            param_groups.append({"params": no_decay, "weight_decay": 0.0})
+            param_groups.append(
+                {"params": no_decay, "weight_decay": 0.0, "irodori_decay": False}
+            )
         if opt_name == "adamw8bit":
             try:
                 from bitsandbytes.optim import AdamW8bit
@@ -466,9 +474,13 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
         muon_decay, muon_no_decay, aux_decay, aux_no_decay = _partition_muon_params(model)
         muon_param_groups = []
         if muon_decay:
-            muon_param_groups.append({"params": muon_decay, "weight_decay": cfg.weight_decay})
+            muon_param_groups.append(
+                {"params": muon_decay, "weight_decay": cfg.weight_decay, "irodori_decay": True}
+            )
         if muon_no_decay:
-            muon_param_groups.append({"params": muon_no_decay, "weight_decay": 0.0})
+            muon_param_groups.append(
+                {"params": muon_no_decay, "weight_decay": 0.0, "irodori_decay": False}
+            )
         if not muon_param_groups:
             raise ValueError("No Muon-compatible parameters found for optimizer=muon.")
 
@@ -482,9 +494,13 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
         aux_opt = None
         aux_param_groups = []
         if aux_decay:
-            aux_param_groups.append({"params": aux_decay, "weight_decay": cfg.weight_decay})
+            aux_param_groups.append(
+                {"params": aux_decay, "weight_decay": cfg.weight_decay, "irodori_decay": True}
+            )
         if aux_no_decay:
-            aux_param_groups.append({"params": aux_no_decay, "weight_decay": 0.0})
+            aux_param_groups.append(
+                {"params": aux_no_decay, "weight_decay": 0.0, "irodori_decay": False}
+            )
         if aux_param_groups:
             aux_opt = aux_cls(
                 aux_param_groups,

@@ -2854,6 +2854,23 @@ def main() -> None:
                 "bf16 stochastic rounding active: optimizer updates computed in fp32, "
                 "params/moments stored bf16."
             )
+        if (
+            train_cfg.pure_bf16
+            and train_cfg.bf16_stochastic_round
+            and train_cfg.optimizer.lower() == "adamw8bit"
+        ):
+            print(
+                "warning: optimizer=adamw8bit does not implement bf16 stochastic rounding. "
+                "Under pure_bf16 its bf16 parameter writes round to nearest, so sub-ulp "
+                "updates (most steps at lr<=1e-4) are silently lost. Use optimizer=adamw "
+                "or muon to get stochastic rounding."
+            )
+        if train_config_uses_lora(train_cfg) and train_cfg.optimizer.lower() == "muon":
+            print(
+                "warning: optimizer=muon Newton-Schulz-orthogonalizes every 2D weight, "
+                "which includes LoRA A/B factors; low-rank adapters are untested under "
+                "Muon. Consider optimizer=adamw for LoRA runs."
+            )
         if train_cfg.gradient_accumulation_steps > 1:
             print(
                 f"Gradient accumulation enabled: steps={train_cfg.gradient_accumulation_steps} (effective global batch={train_cfg.batch_size * world_size * train_cfg.gradient_accumulation_steps})."
@@ -2876,6 +2893,14 @@ def main() -> None:
         resume_payload = None
         if not train_config_uses_lora(train_cfg):
             raw_model.load_state_dict(ckpt["model"])
+        # Snapshot each group's weight-decay intent BEFORE load_state_dict pins the
+        # live group hyperparameters to the checkpoint's copies. build_optimizer
+        # tags groups with irodori_decay; the >0 fallback covers optimizer states
+        # saved before that tag existed.
+        resume_decay_flags = [
+            bool(group.get("irodori_decay", float(group.get("weight_decay", 0.0)) > 0.0))
+            for group in optimizer.param_groups
+        ]
         try:
             optimizer.load_state_dict(ckpt["optimizer"])
         except Exception as exc:
@@ -2892,13 +2917,31 @@ def main() -> None:
         resume_ema_state = ckpt.get("ema_model")
         resume_scheduler_state = ckpt.get("scheduler")
         del ckpt
-        # Rebase LR / weight_decay from current yaml/CLI. Keep Adam moments + step.
-        # (load_state_dict restores old hyperparams from the checkpoint otherwise.)
+        # Rebase every optimizer hyperparameter that has a config field from the
+        # current yaml/CLI. load_state_dict otherwise pins them to the values the
+        # checkpoint was saved with, so edits to lr / weight_decay / momentum /
+        # betas / adjust_lr_fn between runs would be silently ignored. Adam moments
+        # and step counts are preserved.
         new_base = float(train_cfg.learning_rate)
         new_wd = float(train_cfg.weight_decay)
-        for group in optimizer.param_groups:
-            if float(group.get("weight_decay", 0.0)) > 0.0:
-                group["weight_decay"] = new_wd
+        new_momentum = float(train_cfg.muon_momentum)
+        new_betas = (float(train_cfg.adam_beta1), float(train_cfg.adam_beta2))
+        new_eps = float(train_cfg.adam_eps)
+        new_adjust_lr_fn = str(train_cfg.muon_adjust_lr_fn)
+        for is_decay, group in zip(
+            resume_decay_flags, optimizer.param_groups, strict=False
+        ):
+            # Re-tag so a group whose marker was dropped by loading a pre-tag
+            # checkpoint carries irodori_decay in every checkpoint from here on.
+            group["irodori_decay"] = is_decay
+            group["weight_decay"] = new_wd if is_decay else 0.0
+            if "momentum" in group:  # Muon group
+                group["momentum"] = new_momentum
+            if "adjust_lr_fn" in group:  # Muon group
+                group["adjust_lr_fn"] = new_adjust_lr_fn
+            if "betas" in group:  # AdamW / Muon-aux group (Muon groups have none)
+                group["betas"] = new_betas
+                group["eps"] = new_eps
         if scheduler is not None:
             scheduler_state = resume_scheduler_state
             if scheduler_state is not None:
@@ -2918,7 +2961,9 @@ def main() -> None:
             print(
                 f"Resumed from step={step} (epoch={start_epoch}) "
                 f"lr={current_lr(optimizer):.3e} "
-                f"(base={new_base:.3e} weight_decay={new_wd:g})"
+                f"(base={new_base:.3e} weight_decay={new_wd:g} "
+                f"muon_momentum={new_momentum:g} adam_betas={new_betas} "
+                f"adam_eps={new_eps:g} muon_adjust_lr_fn={new_adjust_lr_fn})"
             )
     if train_cfg.ema_enabled:
         ema = ModelEMA(
@@ -3224,6 +3269,11 @@ def main() -> None:
                         loss = duration_loss
                     else:
                         loss = rf_loss + (float(train_cfg.duration_loss_weight) * duration_loss)
+                    # pure_bf16 note: autograd accumulates into bf16 .grad buffers,
+                    # so micro-batch accumulation sums gradients in bf16 (nearest).
+                    # Stochastic rounding covers only the optimizer step, not this
+                    # sum; accum_steps are same-scale additions so the error stays
+                    # negligible.
                     (loss / float(accum_steps)).backward()
                     if caption_warmup_active:
                         clear_non_caption_grads(raw_model)
@@ -3247,6 +3297,11 @@ def main() -> None:
                 accum_duration_mae_frames.zero_()
                 accum_duration_group_totals.zero_()
 
+                # pure_bf16 note: the grad norm is reduced in bf16 here, outside the
+                # fp32 stochastic-rounding path. The resulting ~0.4% jitter is
+                # harmless — Muon rescales updates via Newton-Schulz regardless of
+                # gradient magnitude, so clipping effectively bites only the aux
+                # AdamW group.
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), train_cfg.grad_clip_norm
                 )
