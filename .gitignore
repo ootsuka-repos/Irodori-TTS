@@ -219,3 +219,5 @@ __marimo__/
 # intermediates (manifests, latents, source/training audio) under dataset/data/.
 outputs/
 dataset/data/
+
+.claude/

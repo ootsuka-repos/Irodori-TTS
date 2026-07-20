@@ -2281,7 +2281,10 @@ def main() -> None:
     if is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
         dump_configs(output_dir / "config.json", model_cfg, train_cfg)
-        print(f"Compute precision={train_cfg.precision} (weights/optimizer states kept in fp32).")
+        if train_cfg.pure_bf16 and use_bf16:
+            print("Compute precision=bf16 (pure: weights/grads/optimizer states in bf16).")
+        else:
+            print(f"Compute precision={train_cfg.precision} (weights/optimizer states kept in fp32).")
     if distributed:
         dist.barrier()
     if is_main_process and distributed:
@@ -2768,6 +2771,14 @@ def main() -> None:
         raw_model.set_gradient_checkpointing(True)
         if is_main_process:
             print("Gradient checkpointing enabled on diffusion blocks.")
+    if train_cfg.pure_bf16:
+        if not use_bf16:
+            if is_main_process:
+                print("warning: pure_bf16=True requires precision=bf16; ignoring.")
+        else:
+            raw_model.to(torch.bfloat16)
+            if is_main_process:
+                print("pure_bf16: model cast to bf16 (optimizer states follow param dtype).")
     train_model = raw_model
     if train_cfg.compile_model:
         if not hasattr(torch, "compile"):

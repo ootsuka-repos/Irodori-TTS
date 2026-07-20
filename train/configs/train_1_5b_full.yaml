@@ -1,0 +1,103 @@
+# Irodori-TTS 1.5B (1552.4M params) — trained FROM SCRATCH on a 16 GB GPU.
+# The Aratako/Irodori-TTS-500M-v3 weights do NOT load into this architecture;
+# do not pass --init-checkpoint. Scaled keeping head_dim 64 everywhere:
+# DiT 1280x12 -> 1792x19, text 512x10 -> 1024x12, speaker 768x8 -> 1152x10.
+# text_dim must equal the pretrained backbone's hidden_size (embeddings are
+# initialized from it), so the backbone moves 150m -> 440m (hidden 1024).
+model:
+  latent_dim: 32
+  latent_patch_size: 1
+  text_vocab_size: 99574
+  text_tokenizer_repo: llm-jp/llm-jp-3-440m
+  model_dim: 1792
+  num_layers: 19
+  num_heads: 28
+  mlp_ratio: 2.875
+  text_mlp_ratio: 2.6
+  speaker_mlp_ratio: 2.6
+  text_dim: 1024
+  text_layers: 12
+  text_heads: 16
+  speaker_dim: 1152
+  speaker_layers: 10
+  speaker_heads: 18
+  speaker_patch_size: 1
+  timestep_embed_dim: 512
+  adaln_rank: 256
+  use_duration_predictor: true
+  duration_aux_dim: 14
+  duration_hidden_dim: 1024
+  duration_layers: 3
+  duration_dropout: 0.1
+  duration_attention_heads: 8
+  duration_architecture: token_sum_adarn_zero_no_aux
+  duration_token_init_frames: 9.0
+  duration_speaker_fusion: adarn_zero
+
+train:
+  train_mode: rf
+  # batch 1 + accumulation 4 keeps the effective batch at 4 while minimizing
+  # activation VRAM.
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  length_bucketing: true
+  length_bucket_mult: 64
+  category_balancing: true
+  fixed_target_latent_steps: null
+  fixed_target_full_mask: false
+  # 1.5B on 16 GiB: weights+grads+Muon momentum are ~9 GiB in bf16;
+  # checkpointing keeps activation peak in budget at batch 4.
+  gradient_checkpointing: true
+  data_parallel: false
+  num_workers: 6
+  dataloader_persistent_workers: true
+  dataloader_prefetch_factor: 4
+  allow_tf32: true
+  compile_model: false
+  precision: bf16
+  # No fp32 master weights: params/grads/Muon momentum/EMA all bf16
+  # (~3.1 GiB each instead of ~6.2 GiB). Required to fit 1.55B on 16 GiB.
+  pure_bf16: true
+  optimizer: muon
+  muon_adjust_lr_fn: match_rms_adamw
+  # Scratch training (no pretrained init): higher LR and longer warmup than
+  # the 500M finetune.
+  learning_rate: 0.0001
+  weight_decay: 0.001
+  lr_scheduler: wsd
+  warmup_steps: 3000
+  stable_steps: 900000
+  min_lr_scale: 0.01
+  max_steps: 1000000
+  max_text_len: 256
+  text_condition_dropout: 0.05
+  speaker_condition_dropout: 0.05
+  timestep_stratified: true
+  max_latent_steps: 750
+  rf_loss_mode: utterance_mean
+  duration_loss_weight: 0.1
+  duration_speaker_dropout: 0.0
+  duration_huber_delta: 0.1
+  log_every: 1
+  ema_enabled: true
+  ema_decay: 0.999
+  ema_update_every: 10
+  ema_device: cpu
+  tensorboard_enabled: true
+  tensorboard_log_dir: tensorboard
+  tensorboard_launch: true
+  tensorboard_port: 6006
+  save_every: 0
+  save_every_epochs: 2
+  checkpoint_latest_n: 3
+  checkpoint_best_n: 2
+  sample_every_epochs: 1
+  sample_cuda_visible_devices: "0"
+  sample_num_steps: 24
+  sample_seconds: null
+  sample_seed: 20260715
+  sample_reference_count: 3
+  valid_ratio: 0.0
+  lora_enabled: false
+  wandb_enabled: false
+  seed: 0

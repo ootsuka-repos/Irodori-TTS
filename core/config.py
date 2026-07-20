@@ -176,6 +176,10 @@ class TrainConfig:
     progress: bool = True
     progress_all_ranks: bool = False
     precision: str = "bf16"
+    # Cast model weights (and therefore grads/optimizer states/EMA) to bf16
+    # instead of keeping fp32 masters. Halves the parameter-proportional VRAM;
+    # only meaningful with precision=bf16.
+    pure_bf16: bool = False
     grad_clip_norm: float = 1.0
     gradient_accumulation_steps: int = 1
     max_text_len: int = 256
