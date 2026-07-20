@@ -55,9 +55,15 @@ train:
   allow_tf32: true
   compile_model: false
   precision: bf16
-  # No fp32 master weights: params/grads/Muon momentum/EMA all bf16
-  # (~3.1 GiB each instead of ~6.2 GiB). Required to fit 1.55B on 16 GiB.
+  # No fp32 master weights: params/grads/Muon momentum all bf16 (~3.1 GiB each
+  # instead of ~6.2 GiB). Required to fit 1.55B on 16 GiB. EMA shadow stays
+  # fp32 on CPU (train/ema.py).
   pure_bf16: true
+  # Optimizer steps compute in fp32 and store bf16 with stochastic rounding.
+  # Without it, updates below half a bf16 ulp (~80% of Muon updates at lr 1e-4,
+  # ~98% during early warmup) and all weight-decay multiplies round back to the
+  # old value and are lost.
+  bf16_stochastic_round: true
   optimizer: muon
   muon_adjust_lr_fn: match_rms_adamw
   # Scratch training (no pretrained init): higher LR and longer warmup than

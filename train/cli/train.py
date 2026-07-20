@@ -2845,6 +2845,15 @@ def main() -> None:
         print(
             f"Optimizer={train_cfg.optimizer} Scheduler={train_cfg.lr_scheduler} lr={current_lr(optimizer):.3e}"
         )
+        if (
+            train_cfg.pure_bf16
+            and train_cfg.bf16_stochastic_round
+            and train_cfg.optimizer.lower() in {"muon", "adamw"}
+        ):
+            print(
+                "bf16 stochastic rounding active: optimizer updates computed in fp32, "
+                "params/moments stored bf16."
+            )
         if train_cfg.gradient_accumulation_steps > 1:
             print(
                 f"Gradient accumulation enabled: steps={train_cfg.gradient_accumulation_steps} (effective global batch={train_cfg.batch_size * world_size * train_cfg.gradient_accumulation_steps})."
@@ -3500,6 +3509,7 @@ def main() -> None:
             # A broken iteration may still own one prefetched GPU batch.
             # Closing the generator releases it before final validation/save.
             device_batches.close()
+            epoch_checkpoint_path: Path | None = None
             if (
                 train_cfg.save_every_epochs > 0
                 and epoch % train_cfg.save_every_epochs == 0
@@ -3523,31 +3533,59 @@ def main() -> None:
                     output_dir=output_dir,
                     keep_count=periodic_checkpoint_keep,
                 )
-                if (
-                    train_cfg.sample_every_epochs > 0
-                    and epoch % train_cfg.sample_every_epochs == 0
-                ):
-                    progress.write(
-                        f"generating comparison samples for epoch={epoch} step={step}..."
+            if (
+                train_cfg.sample_every_epochs > 0
+                and epoch % train_cfg.sample_every_epochs == 0
+                and step < train_cfg.max_steps
+                and is_main_process
+            ):
+                # Sampling reads weights from a checkpoint file; on epochs
+                # where no periodic checkpoint was saved, write a temporary
+                # one and remove it after sampling.
+                sample_checkpoint_path = epoch_checkpoint_path
+                temp_sample_checkpoint: Path | None = None
+                if sample_checkpoint_path is None:
+                    temp_sample_checkpoint = (
+                        output_dir / f"checkpoint_sample_tmp_{step:07d}.pt"
                     )
-                    if device.type == "cuda":
-                        # The sampling subprocess may share this GPU; release
-                        # cached blocks so it can allocate its model + codec.
-                        torch.cuda.empty_cache()
+                    save_checkpoint(
+                        temp_sample_checkpoint,
+                        raw_model,
+                        optimizer,
+                        scheduler,
+                        step,
+                        model_cfg,
+                        train_cfg,
+                        base_init=base_init,
+                        epoch=epoch,
+                        ema=ema,
+                    )
+                    sample_checkpoint_path = temp_sample_checkpoint
+                progress.write(
+                    f"generating comparison samples for epoch={epoch} step={step}..."
+                )
+                if device.type == "cuda":
+                    # The sampling subprocess may share this GPU; release
+                    # cached blocks so it can allocate its model + codec.
+                    torch.cuda.empty_cache()
+                try:
                     sample_ok, sample_dir = run_epoch_test_inference(
-                        checkpoint_path=epoch_checkpoint_path,
+                        checkpoint_path=sample_checkpoint_path,
                         manifest_path=train_cfg.manifest_path,
                         output_dir=output_dir,
                         epoch=epoch,
                         step=step,
                         train_cfg=train_cfg,
                     )
-                    if sample_ok:
-                        progress.write(f"saved comparison samples: {sample_dir}")
-                    else:
-                        progress.write(
-                            f"warning: comparison sample generation failed; see {sample_dir / 'inference.log'}"
-                        )
+                finally:
+                    if temp_sample_checkpoint is not None:
+                        temp_sample_checkpoint.unlink(missing_ok=True)
+                if sample_ok:
+                    progress.write(f"saved comparison samples: {sample_dir}")
+                else:
+                    progress.write(
+                        f"warning: comparison sample generation failed; see {sample_dir / 'inference.log'}"
+                    )
             if distributed and train_cfg.sample_every_epochs > 0:
                 dist.barrier()
 

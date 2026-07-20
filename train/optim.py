@@ -17,9 +17,18 @@ class MuonWithAuxAdamW:
     def __init__(self, muon_opt: torch.optim.Optimizer, aux_opt: torch.optim.Optimizer | None):
         self.muon_opt = muon_opt
         self.aux_opt = aux_opt
-        self.param_groups = list(muon_opt.param_groups)
-        if aux_opt is not None:
-            self.param_groups.extend(aux_opt.param_groups)
+
+    @property
+    def param_groups(self) -> list[dict]:
+        # Must be a live view, not an __init__-time snapshot: torch's
+        # Optimizer.load_state_dict replaces the inner optimizers' group dicts,
+        # so a snapshot would leave the LR scheduler and the resume-time lr/wd
+        # rebase mutating dead dicts while the real optimizers keep the
+        # checkpoint-time values forever.
+        groups = list(self.muon_opt.param_groups)
+        if self.aux_opt is not None:
+            groups.extend(self.aux_opt.param_groups)
+        return groups
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         self.muon_opt.zero_grad(set_to_none=set_to_none)
@@ -79,6 +88,230 @@ class ScalarLRScheduler:
                 self.base_lrs = loaded_base_lrs
         if "last_step" in state_dict:
             self.last_step = int(state_dict["last_step"])
+
+
+# Fixed seed so every DDP rank draws identical rounding noise and parameters
+# stay bit-identical across ranks (grads are already synced before step()).
+_SR_SEED = 0x5EEDBF16
+
+
+def _round_copy_(
+    dst: torch.Tensor,
+    src_f32: torch.Tensor,
+    generators: dict[torch.device, torch.Generator],
+) -> None:
+    """
+    Store fp32 results into ``dst``. For bf16 destinations use stochastic
+    rounding: add uniform 16-bit noise to the fp32 bit pattern and truncate the
+    low mantissa bits, which rounds to either bf16 neighbour with probability
+    proportional to proximity (unbiased in expectation). Plain nearest rounding
+    would silently drop any update smaller than half a bf16 ulp — at
+    lr<=1e-4 that is the majority of Muon/AdamW updates and every weight-decay
+    multiply.
+    """
+    if dst.dtype is not torch.bfloat16:
+        dst.copy_(src_f32)
+        return
+    gen = generators.get(src_f32.device)
+    if gen is None:
+        gen = torch.Generator(device=src_f32.device)
+        gen.manual_seed(_SR_SEED)
+        generators[src_f32.device] = gen
+    bits = src_f32.contiguous().view(torch.int32)
+    noise = torch.randint(
+        0, 1 << 16, bits.shape, device=bits.device, dtype=torch.int32, generator=gen
+    )
+    bits = (bits + noise) & -65536  # keep sign/exponent/high-mantissa (0xFFFF0000)
+    dst.copy_(bits.view(torch.float32))
+
+
+def _zeropower_via_newtonschulz(
+    grad: torch.Tensor,
+    ns_coefficients: tuple[float, float, float],
+    ns_steps: int,
+    eps: float,
+) -> torch.Tensor:
+    # Verbatim port of torch.optim._muon._zeropower_via_newtonschulz (2.10) so
+    # MuonBF16SR matches torch.optim.Muon exactly; kept local because that
+    # module is private API. NS deliberately runs in bf16.
+    if ns_steps >= 100:
+        raise ValueError("Number of steps must be less than 100 for computational efficiency")
+    if grad.ndim != 2:
+        raise ValueError("Input tensor gradient must be a 2D matrix")
+    a, b, c = ns_coefficients
+    ortho_grad = grad.bfloat16()
+    if grad.size(0) > grad.size(1):
+        ortho_grad = ortho_grad.T
+    ortho_grad.div_(ortho_grad.norm().clamp(min=eps))
+    for _ in range(ns_steps):
+        gram_matrix = ortho_grad @ ortho_grad.T
+        gram_update = torch.addmm(gram_matrix, gram_matrix, gram_matrix, beta=b, alpha=c)
+        ortho_grad = torch.addmm(ortho_grad, gram_update, ortho_grad, beta=a)
+    if grad.size(0) > grad.size(1):
+        ortho_grad = ortho_grad.T
+    return ortho_grad
+
+
+def _adjust_muon_lr(lr: float, adjust_lr_fn: str | None, param_shape: torch.Size) -> float:
+    # Port of torch.optim._muon._adjust_lr (2.10).
+    A, B = param_shape[:2]
+    if adjust_lr_fn is None or adjust_lr_fn == "original":
+        adjusted_ratio = math.sqrt(max(1, A / B))
+    elif adjust_lr_fn == "match_rms_adamw":
+        adjusted_ratio = 0.2 * math.sqrt(max(A, B))
+    else:
+        adjusted_ratio = 1.0
+    return lr * adjusted_ratio
+
+
+class MuonBF16SR(torch.optim.Optimizer):
+    """
+    Muon with the exact update rule of torch.optim.Muon, but the momentum lerp
+    and parameter update are computed in fp32 and stored back with stochastic
+    rounding when the tensors are bf16 (pure_bf16 mode). Memory layout is
+    unchanged: params/grads/momentum stay bf16, only per-tensor fp32
+    temporaries are allocated during step().
+
+    Group defaults and per-param state ("momentum_buffer") are laid out
+    identically to torch.optim.Muon, so checkpoints are interchangeable
+    between the two implementations in both directions.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        weight_decay: float = 0.1,
+        momentum: float = 0.95,
+        nesterov: bool = True,
+        ns_coefficients: tuple[float, float, float] = (3.4445, -4.7750, 2.0315),
+        eps: float = 1e-7,
+        ns_steps: int = 5,
+        adjust_lr_fn: str | None = None,
+    ) -> None:
+        if lr < 0.0:
+            raise ValueError(f"Learning rate should be >= 0 but is: {lr}")
+        if momentum < 0.0:
+            raise ValueError(f"momentum should be >= 0 but is: {momentum}")
+        if weight_decay < 0.0:
+            raise ValueError(f"weight decay should be >= 0 but is: {weight_decay}")
+        if adjust_lr_fn is not None and adjust_lr_fn not in ("original", "match_rms_adamw"):
+            raise ValueError(f"Adjust learning rate function {adjust_lr_fn} is not supported")
+        defaults = {
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "momentum": momentum,
+            "nesterov": nesterov,
+            "ns_coefficients": ns_coefficients,
+            "eps": eps,
+            "ns_steps": ns_steps,
+            "adjust_lr_fn": adjust_lr_fn,
+        }
+        super().__init__(params, defaults)
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.ndim != 2:
+                    raise ValueError(
+                        "Muon only supports 2D parameters whereas we found a parameter "
+                        f"with size: {p.size()}"
+                    )
+        self._sr_generators: dict[torch.device, torch.Generator] = {}
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            lr = float(group["lr"])
+            weight_decay = float(group["weight_decay"])
+            momentum = float(group["momentum"])
+            nesterov = bool(group["nesterov"])
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                state = self.state[p]
+                buf = state.get("momentum_buffer")
+                if buf is None:
+                    buf = torch.zeros_like(grad, memory_format=torch.preserve_format)
+                    state["momentum_buffer"] = buf
+                buf_f32 = buf.float().lerp_(grad.float(), 1.0 - momentum)
+                _round_copy_(buf, buf_f32, self._sr_generators)
+                update = grad.float().lerp(buf_f32, momentum) if nesterov else buf_f32
+                update = _zeropower_via_newtonschulz(
+                    update,
+                    group["ns_coefficients"],
+                    int(group["ns_steps"]),
+                    float(group["eps"]),
+                )
+                adjusted_lr = _adjust_muon_lr(lr, group["adjust_lr_fn"], p.shape)
+                new_p = p.float().mul_(1.0 - lr * weight_decay).add_(
+                    update.float(), alpha=-adjusted_lr
+                )
+                _round_copy_(p, new_p, self._sr_generators)
+        return loss
+
+
+class AdamWBF16SR(torch.optim.AdamW):
+    """
+    AdamW (decoupled weight decay) computing the step in fp32 and storing
+    params and both moments back with stochastic rounding when bf16. State
+    layout ("step"/"exp_avg"/"exp_avg_sq") matches torch.optim.AdamW, so
+    checkpoints load in either direction. Moments matter here too: the
+    exp_avg_sq lerp contributes (1-beta2)=1e-3 relatively, below the bf16
+    resolution, so without SR the second moment freezes.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._sr_generators: dict[torch.device, torch.Generator] = {}
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            if group.get("amsgrad") or group.get("maximize"):
+                raise RuntimeError(
+                    "AdamWBF16SR supports only amsgrad=False, maximize=False."
+                )
+            lr = float(group["lr"])
+            weight_decay = float(group["weight_decay"])
+            beta1, beta2 = group["betas"]
+            eps = float(group["eps"])
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad.float()
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = torch.tensor(0.0)
+                    state["exp_avg"] = torch.zeros_like(
+                        p, memory_format=torch.preserve_format
+                    )
+                    state["exp_avg_sq"] = torch.zeros_like(
+                        p, memory_format=torch.preserve_format
+                    )
+                state["step"] += 1
+                step_t = float(state["step"].item())
+                exp_avg_f32 = state["exp_avg"].float().lerp_(grad, 1.0 - beta1)
+                _round_copy_(state["exp_avg"], exp_avg_f32, self._sr_generators)
+                exp_avg_sq_f32 = (
+                    state["exp_avg_sq"].float().mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+                )
+                _round_copy_(state["exp_avg_sq"], exp_avg_sq_f32, self._sr_generators)
+                bias_correction1 = 1.0 - beta1**step_t
+                bias_correction2 = 1.0 - beta2**step_t
+                denom = (exp_avg_sq_f32 / bias_correction2).sqrt_().add_(eps)
+                new_p = p.float().mul_(1.0 - lr * weight_decay).addcdiv_(
+                    exp_avg_f32, denom, value=-(lr / bias_correction1)
+                )
+                _round_copy_(p, new_p, self._sr_generators)
+        return loss
 
 
 def _use_weight_decay(name: str, p: torch.nn.Parameter) -> bool:
@@ -153,15 +386,19 @@ def _partition_muon_params(
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        # Muon is intended for hidden matrix-like weights.
-        # Keep embeddings/output heads/bias-like params on Adam. Norm gains can
-        # be 2D here (per-head RMSNorm weights) but are scales, not matrices,
-        # so orthogonalizing them would destroy their meaning.
+        # Muon is intended for hidden matrix-like weights; torch.optim.Muon
+        # hard-requires ndim == 2, so route anything else (vectors, but also
+        # e.g. (1,1,dim) query tokens or conv kernels) to Adam instead of
+        # crashing at construction. Keep embeddings/output heads/bias-like
+        # params on Adam. Norm gains can be 2D here (per-head RMSNorm weights)
+        # but are scales, not matrices, so orthogonalizing them would destroy
+        # their meaning.
+        lname = name.lower()
         is_muon_candidate = (
-            p.ndim >= 2
-            and "embedding" not in name
-            and "norm" not in name.lower()
-            and not name.endswith("out_proj.weight")
+            p.ndim == 2
+            and "embedding" not in lname
+            and "norm" not in lname
+            and not lname.endswith("out_proj.weight")
         )
         has_decay = _use_weight_decay(name, p)
         if is_muon_candidate:
@@ -179,6 +416,11 @@ def _partition_muon_params(
 
 def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
     opt_name = cfg.optimizer.lower()
+    # pure_bf16 stores params/grads/moments in bf16; nearest rounding there
+    # loses most updates (see _round_copy_), so switch to the fp32-math +
+    # stochastic-rounding implementations. Harmless when the model was left
+    # fp32 (the SR store is dtype-gated per tensor).
+    use_bf16_sr = bool(cfg.pure_bf16) and bool(cfg.bf16_stochastic_round)
     if opt_name in {"adamw", "adamw8bit"}:
         decay, no_decay = _partition_adamw_params(model)
         param_groups = []
@@ -186,7 +428,6 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
             param_groups.append({"params": decay, "weight_decay": cfg.weight_decay})
         if no_decay:
             param_groups.append({"params": no_decay, "weight_decay": 0.0})
-        optimizer_cls = torch.optim.AdamW
         if opt_name == "adamw8bit":
             try:
                 from bitsandbytes.optim import AdamW8bit
@@ -195,6 +436,8 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
                     "optimizer=adamw8bit requires bitsandbytes. Install the project dependencies."
                 ) from exc
             optimizer_cls = AdamW8bit
+        else:
+            optimizer_cls = AdamWBF16SR if use_bf16_sr else torch.optim.AdamW
         return optimizer_cls(
             param_groups if param_groups else model.parameters(),
             lr=cfg.learning_rate,
@@ -203,16 +446,22 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
             eps=cfg.adam_eps,
         )
     if opt_name == "muon":
-        if not hasattr(torch.optim, "Muon"):
-            raise RuntimeError(
-                "optimizer=muon requires torch.optim.Muon (available in newer PyTorch releases)."
-            )
         adjust_lr_fn = cfg.muon_adjust_lr_fn
         if adjust_lr_fn not in {"original", "match_rms_adamw"}:
             raise ValueError(
                 "muon_adjust_lr_fn must be one of ['original', 'match_rms_adamw'], "
                 f"got {adjust_lr_fn!r}"
             )
+        if use_bf16_sr:
+            muon_cls: type[torch.optim.Optimizer] = MuonBF16SR
+            aux_cls: type[torch.optim.Optimizer] = AdamWBF16SR
+        else:
+            if not hasattr(torch.optim, "Muon"):
+                raise RuntimeError(
+                    "optimizer=muon requires torch.optim.Muon (available in newer PyTorch releases)."
+                )
+            muon_cls = torch.optim.Muon
+            aux_cls = torch.optim.AdamW
 
         muon_decay, muon_no_decay, aux_decay, aux_no_decay = _partition_muon_params(model)
         muon_param_groups = []
@@ -223,7 +472,7 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
         if not muon_param_groups:
             raise ValueError("No Muon-compatible parameters found for optimizer=muon.")
 
-        muon_opt = torch.optim.Muon(
+        muon_opt = muon_cls(
             muon_param_groups,
             lr=cfg.learning_rate,
             weight_decay=0.0,
@@ -237,7 +486,7 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
         if aux_no_decay:
             aux_param_groups.append({"params": aux_no_decay, "weight_decay": 0.0})
         if aux_param_groups:
-            aux_opt = torch.optim.AdamW(
+            aux_opt = aux_cls(
                 aux_param_groups,
                 lr=cfg.learning_rate,
                 weight_decay=0.0,

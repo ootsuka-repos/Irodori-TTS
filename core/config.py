@@ -180,6 +180,11 @@ class TrainConfig:
     # instead of keeping fp32 masters. Halves the parameter-proportional VRAM;
     # only meaningful with precision=bf16.
     pure_bf16: bool = False
+    # With pure_bf16, compute optimizer updates in fp32 and store params/moments
+    # back to bf16 with stochastic rounding. Without this, updates smaller than
+    # half a bf16 ulp (most Muon updates at lr<=1e-4, and all weight-decay
+    # multiplies) round back to the old value and are silently lost.
+    bf16_stochastic_round: bool = True
     grad_clip_norm: float = 1.0
     gradient_accumulation_steps: int = 1
     max_text_len: int = 256
