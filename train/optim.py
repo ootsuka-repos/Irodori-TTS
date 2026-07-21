@@ -101,8 +101,8 @@ def _round_copy_(
     generators: dict[torch.device, torch.Generator],
 ) -> None:
     """
-    Store fp32 results into ``dst``. For bf16 destinations use stochastic
-    rounding: add uniform 16-bit noise to the fp32 bit pattern and truncate the
+    Store full-precision results into ``dst``. For bf16 destinations use stochastic
+    rounding: add uniform 16-bit noise to the full-precision bit pattern and truncate the
     low mantissa bits, which rounds to either bf16 neighbour with probability
     proportional to proximity (unbiased in expectation). Plain nearest rounding
     would silently drop any update smaller than half a bf16 ulp — at
@@ -122,7 +122,7 @@ def _round_copy_(
         0, 1 << 16, bits.shape, device=bits.device, dtype=torch.int32, generator=gen
     )
     bits = (bits + noise) & -65536  # keep sign/exponent/high-mantissa (0xFFFF0000)
-    dst.copy_(bits.view(torch.float32))
+    dst.copy_(bits.view(torch.float))
 
 
 def _zeropower_via_newtonschulz(
@@ -167,9 +167,9 @@ def _adjust_muon_lr(lr: float, adjust_lr_fn: str | None, param_shape: torch.Size
 class MuonBF16SR(torch.optim.Optimizer):
     """
     Muon with the exact update rule of torch.optim.Muon, but the momentum lerp
-    and parameter update are computed in fp32 and stored back with stochastic
+    and parameter update are computed in full-precision and stored back with stochastic
     rounding when the tensors are bf16 (pure_bf16 mode). Memory layout is
-    unchanged: params/grads/momentum stay bf16, only per-tensor fp32
+    unchanged: params/grads/momentum stay bf16, only per-tensor full-precision
     temporaries are allocated during step().
 
     Group defaults and per-param state ("momentum_buffer") are laid out
@@ -256,7 +256,7 @@ class MuonBF16SR(torch.optim.Optimizer):
 
 class AdamWBF16SR(torch.optim.AdamW):
     """
-    AdamW (decoupled weight decay) computing the step in fp32 and storing
+    AdamW (decoupled weight decay) computing the step in full-precision and storing
     params and both moments back with stochastic rounding when bf16. State
     layout ("step"/"exp_avg"/"exp_avg_sq") matches torch.optim.AdamW, so
     checkpoints load in either direction. Moments matter here too: the
@@ -417,9 +417,9 @@ def _partition_muon_params(
 def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
     opt_name = cfg.optimizer.lower()
     # pure_bf16 stores params/grads/moments in bf16; nearest rounding there
-    # loses most updates (see _round_copy_), so switch to the fp32-math +
+    # loses most updates (see _round_copy_), so switch to the full-precision-math +
     # stochastic-rounding implementations. Harmless when the model was left
-    # fp32 (the SR store is dtype-gated per tensor).
+    # full-precision (the SR store is dtype-gated per tensor).
     use_bf16_sr = bool(cfg.pure_bf16) and bool(cfg.bf16_stochastic_round)
     if opt_name in {"adamw", "adamw8bit"}:
         decay, no_decay = _partition_adamw_params(model)

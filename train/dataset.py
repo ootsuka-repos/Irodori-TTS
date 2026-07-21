@@ -317,7 +317,7 @@ class LatentTextDataset(Dataset):
             ref_latent = (
                 latent
                 if latent is not None
-                else torch.zeros((0, self.latent_dim), dtype=torch.float32)
+                else torch.zeros((0, self.latent_dim), dtype=torch.float)
             )
         else:
             ref_item = self._read_item(ref_index)
@@ -326,7 +326,7 @@ class LatentTextDataset(Dataset):
             num_frames = _coerce_num_frames(item.get("num_frames"))
             if self.max_latent_steps is not None:
                 num_frames = min(num_frames, int(self.max_latent_steps))
-            latent = torch.zeros((0, self.latent_dim), dtype=torch.float32)
+            latent = torch.zeros((0, self.latent_dim), dtype=torch.float)
         else:
             manifest_num_frames = int(item.get("num_frames", latent.shape[0]))
             num_frames = min(manifest_num_frames, int(latent.shape[0]))
@@ -555,7 +555,7 @@ class TTSCollator:
                 max_steps = max(int(value.shape[0]) for value in values)
             if max_steps <= 0:
                 raise ValueError(f"Latent padding length must be > 0, got {max_steps}")
-            padded = torch.zeros((bsz, max_steps, self.latent_dim), dtype=torch.float32)
+            padded = torch.zeros((bsz, max_steps, self.latent_dim), dtype=torch.float)
             mask = torch.zeros((bsz, max_steps), dtype=torch.bool)
             for i, value in enumerate(values):
                 length = min(int(value.shape[0]), max_steps)

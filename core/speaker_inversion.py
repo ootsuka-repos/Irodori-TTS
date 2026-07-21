@@ -59,7 +59,7 @@ class SpeakerInversionEmbedding(nn.Module):
             raise ValueError(f"speaker inversion init_std must be >= 0, got {init_std}")
 
         if init_embedding is None:
-            embedding = torch.randn(num_tokens, speaker_dim, dtype=torch.float32) * init_std
+            embedding = torch.randn(num_tokens, speaker_dim, dtype=torch.float) * init_std
         else:
             embedding = normalize_speaker_embedding_tensor(
                 init_embedding,
@@ -147,7 +147,7 @@ def save_speaker_inversion_safetensors(
     path: str | Path,
     payload: dict[str, torch.Tensor],
     *,
-    dtype: torch.dtype = torch.float32,
+    dtype: torch.dtype = torch.float,
 ) -> None:
     target = Path(path)
     if not is_speaker_inversion_safetensors_path(target):

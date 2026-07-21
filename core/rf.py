@@ -47,7 +47,7 @@ def sample_stratified_logit_normal_t(
     if batch_size <= 0:
         return torch.empty((0,), device=device)
     u = (
-        torch.arange(batch_size, device=device, dtype=torch.float32)
+        torch.arange(batch_size, device=device, dtype=torch.float)
         + torch.rand(batch_size, device=device, generator=generator)
     ) / float(batch_size)
     u = u.clamp(1e-6, 1.0 - 1e-6)

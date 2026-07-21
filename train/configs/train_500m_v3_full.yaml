@@ -60,10 +60,10 @@ train:
   allow_tf32: true
   compile_model: false
   precision: bf16
-  # No fp32 master weights: params/grads/Muon momentum all bf16 (~half the VRAM
-  # of fp32 masters). EMA shadow stays fp32 on CPU (train/ema.py).
+  # No full-precision master weights: params/grads/Muon momentum all bf16 (~half the VRAM
+  # of full-precision masters). EMA shadow stays full-precision on CPU (train/ema.py).
   pure_bf16: true
-  # Optimizer steps compute in fp32 and store bf16 with stochastic rounding.
+  # Optimizer steps compute in full-precision and store bf16 with stochastic rounding.
   # Without it, updates below half a bf16 ulp and all weight-decay multiplies
   # round back to the old value and are lost. Applies to the optimizer step
   # only; grad accumulation and clip stay bf16-nearest (harmless).

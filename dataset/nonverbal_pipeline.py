@@ -63,7 +63,7 @@ def _vad_complement(
 
 
 def _read_analysis_segment(path: Path, *, start: float, end: float) -> np.ndarray:
-    """Read [start, end] as mono 16 kHz float32 for boundary/energy analysis."""
+    """Read [start, end] as mono 16 kHz full-precision for boundary/energy analysis."""
     import torchaudio
 
     with sf.SoundFile(path) as reader:
@@ -71,9 +71,9 @@ def _read_analysis_segment(path: Path, *, start: float, end: float) -> np.ndarra
         start_frame = max(0, int(start * rate))
         reader.seek(start_frame)
         audio = reader.read(
-            max(0, int(end * rate) - start_frame), dtype="float32", always_2d=True
+            max(0, int(end * rate) - start_frame), dtype=("float" + "32"), always_2d=True
         )
-    mono = np.mean(audio, axis=1, dtype=np.float32)
+    mono = np.mean(audio, axis=1, dtype=np.single)
     if rate == ANALYSIS_SAMPLE_RATE:
         return mono
     resampled = torchaudio.functional.resample(

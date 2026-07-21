@@ -47,6 +47,9 @@ LATENT_ENCODE_PARAMS: dict[str, Any] = {
     "deterministic_encode": True,
     "deterministic_decode": True,
     "text_normalize": False,
+    # DACVAECodec.load のデフォルトdtype（core/codec.py）。単精度→bf16化に伴い
+    # キーへ追加 — 旧単精度 latentディレクトリを自動無効化して全再エンコードさせる。
+    "encode_dtype": "bfloat16",
 }
 PUBLISH_BACKUP_KEEP = 5
 

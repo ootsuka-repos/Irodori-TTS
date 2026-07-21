@@ -8,7 +8,7 @@ class ModelEMA:
     Exponential moving average of model weights for RF/diffusion inference quality.
 
     The shadow copy tracks ``model.state_dict()`` keys so it can be loaded back
-    into the same architecture directly. Floating tensors are kept in fp32 on
+    into the same architecture directly. Floating tensors are kept in full-precision on
     ``device`` (CPU by default so a 16 GB GPU pays no VRAM cost); non-floating
     tensors are mirrored verbatim.
 

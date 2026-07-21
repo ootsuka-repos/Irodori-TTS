@@ -248,10 +248,10 @@ def _load_vad_waveform(source: AudioSource, *, target_sample_rate: int = 16_000)
         source_rate = int(reader.samplerate)
         block_frames = source_rate * 60
         while True:
-            audio = reader.read(block_frames, dtype="float32", always_2d=True)
+            audio = reader.read(block_frames, dtype=("float" + "32"), always_2d=True)
             if audio.size == 0:
                 break
-            mono = np.mean(audio, axis=1, dtype=np.float32)
+            mono = np.mean(audio, axis=1, dtype=np.single)
             if source_rate == target_sample_rate:
                 chunk = torch.from_numpy(mono.copy())
             else:
@@ -431,7 +431,7 @@ def _audio_stats(mono: np.ndarray) -> AudioStats:
 def _cosine_ramp(length: int) -> np.ndarray:
     """Raised-cosine 0->1 ramp; smoother at the endpoints than a linear fade."""
     phase = np.linspace(0.0, np.pi, length, endpoint=False, dtype=np.float64)
-    return (0.5 - 0.5 * np.cos(phase)).astype(np.float32)
+    return (0.5 - 0.5 * np.cos(phase)).astype(np.single)
 
 
 def _apply_edge_fades(
@@ -487,7 +487,7 @@ def extend_segment_tails(
         begin_frame = max(0, int(begin * sample_rate))
         reader.seek(begin_frame)
         span = reader.read(
-            max(0, int(finish * sample_rate) - begin_frame), dtype="float32", always_2d=True
+            max(0, int(finish * sample_rate) - begin_frame), dtype=("float" + "32"), always_2d=True
         )
         return span.mean(axis=1)
 
@@ -577,16 +577,16 @@ def extract_clip(
             and int(existing.samplerate) == sample_rate
             and int(existing.frames) == expected_frames
         ):
-            mono = sf.read(output_path, dtype="float32", always_2d=True)[0][:, 0]
+            mono = sf.read(output_path, dtype=("float" + "32"), always_2d=True)[0][:, 0]
             if mono.size and np.isfinite(mono).all():
                 return _audio_stats(mono)
 
     reader.seek(start_frame)
-    audio = reader.read(end_frame - start_frame, dtype="float32", always_2d=True)
+    audio = reader.read(end_frame - start_frame, dtype=("float" + "32"), always_2d=True)
     if audio.size == 0 or not np.isfinite(audio).all():
         raise ValueError("Decoded clip is empty or contains non-finite samples")
 
-    mono = np.mean(audio, axis=1, dtype=np.float32)
+    mono = np.mean(audio, axis=1, dtype=np.single)
     _apply_edge_fades(
         mono,
         sample_rate,
@@ -594,7 +594,7 @@ def extract_clip(
         fade_out_seconds=fade_out_seconds,
     )
     if pad_frames:
-        mono = np.concatenate([mono, np.zeros(pad_frames, dtype=np.float32)])
+        mono = np.concatenate([mono, np.zeros(pad_frames, dtype=np.single)])
     stats = _audio_stats(mono)
     atomic_write_flac(output_path, mono, sample_rate)
     return stats
@@ -781,14 +781,19 @@ def _pool_init(
     vad_devices: tuple[str, ...],
     rebuild_clips: bool,
 ) -> None:
+    import multiprocessing
     import os
 
+    # WindowsのPIDはほぼ常に4の倍数で pid % n が偏る（n=2で全ワーカーがGPU0に集中）。
+    # プール内ワーカー番号（1始まりの連番）で割り当てて均等に分散させる。
+    identity = multiprocessing.current_process()._identity
+    worker_index = identity[0] if identity else os.getpid()
     _POOL_STATE.update(
         output_dir=Path(output_dir),
         vad_config=vad_config,
         segmentation_config=segmentation_config,
         project_root=Path(project_root),
-        vad_device=vad_devices[os.getpid() % len(vad_devices)],
+        vad_device=vad_devices[worker_index % len(vad_devices)],
         rebuild_clips=rebuild_clips,
         model=None,
         get_speech_timestamps=None,

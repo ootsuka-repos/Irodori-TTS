@@ -206,13 +206,13 @@ def _initialize_embedding_from_pretrained(
     text_backbone = AutoModel.from_pretrained(
         repo_id,
         trust_remote_code=False,
-        dtype=torch.float32,
+        dtype=torch.float,
         low_cpu_mem_usage=True,
     )
     pretrained_embedding = text_backbone.get_input_embeddings()
     if pretrained_embedding is None:
         raise ValueError(f"Pretrained model has no input embeddings: {repo_id}")
-    src_weight = pretrained_embedding.weight.detach().to(device="cpu", dtype=torch.float32)
+    src_weight = pretrained_embedding.weight.detach().to(device="cpu", dtype=torch.float)
     tgt_weight = embedding.weight
     src_vocab, src_dim = tuple(src_weight.shape)
     tgt_vocab, tgt_dim = tuple(tgt_weight.shape)

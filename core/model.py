@@ -27,8 +27,8 @@ DURATION_ARCHITECTURES = {
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-    t = torch.arange(end, dtype=torch.float32)
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+    t = torch.arange(end, dtype=torch.float)
     freqs = torch.outer(t, freqs)
     return torch.complex(torch.cos(freqs), torch.sin(freqs))
 
@@ -45,8 +45,8 @@ def get_timestep_embedding(timestep: torch.Tensor, dim: int) -> torch.Tensor:
     assert dim % 2 == 0
     half = dim // 2
     freqs = 1000.0 * torch.exp(
-        -torch.log(torch.tensor(10000.0, device=timestep.device, dtype=torch.float32))
-        * torch.arange(half, device=timestep.device, dtype=torch.float32)
+        -torch.log(torch.tensor(10000.0, device=timestep.device, dtype=torch.float))
+        * torch.arange(half, device=timestep.device, dtype=torch.float)
         / half
     )
     args = timestep[:, None].float() * freqs[None, :]

@@ -103,7 +103,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--dtype",
-        choices=("float16", "bfloat16", "float32"),
+        choices=("float16", "bfloat16"),
         default="float16",
     )
     parser.add_argument("--batch-size", type=int, default=16)

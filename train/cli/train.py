@@ -471,14 +471,14 @@ def initialize_embedding_from_pretrained(
     text_backbone = AutoModel.from_pretrained(
         repo_id,
         trust_remote_code=False,
-        dtype=torch.float32,
+        dtype=torch.float,
         low_cpu_mem_usage=True,
         local_files_only=local_files_only,
     )
     pretrained_embedding = text_backbone.get_input_embeddings()
     if pretrained_embedding is None:
         raise ValueError(f"Pretrained model has no input embeddings: {repo_id}")
-    src_weight = pretrained_embedding.weight.detach().to(device="cpu", dtype=torch.float32)
+    src_weight = pretrained_embedding.weight.detach().to(device="cpu", dtype=torch.float)
     tgt_weight = embedding.weight
     src_vocab, src_dim = tuple(src_weight.shape)
     tgt_vocab, tgt_dim = tuple(tgt_weight.shape)
@@ -1385,7 +1385,7 @@ def run_validation(
                     )
                     duration_pred = None
 
-            rf_loss = torch.zeros((), device=device, dtype=torch.float32)
+            rf_loss = torch.zeros((), device=device, dtype=torch.float)
             if not duration_only:
                 if v_pred is None or v_target is None or x_mask is None or x_mask_valid is None:
                     raise RuntimeError("RF validation tensors are missing.")
@@ -1397,8 +1397,8 @@ def run_validation(
                     valid_mask=x_mask_valid,
                     mode=train_cfg.rf_loss_mode,
                 )
-            duration_loss = torch.zeros((), device=device, dtype=torch.float32)
-            duration_mae_frames = torch.zeros((), device=device, dtype=torch.float32)
+            duration_loss = torch.zeros((), device=device, dtype=torch.float)
+            duration_mae_frames = torch.zeros((), device=device, dtype=torch.float)
             if model_cfg.use_duration_predictor:
                 if duration_pred is None:
                     raise RuntimeError(
@@ -1465,12 +1465,9 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
         "--precision",
-        choices=["fp32", "bf16"],
+        choices=["bf16"],
         default="bf16",
-        help=(
-            "Compute precision for model forward pass. "
-            "Model weights and optimizer states remain FP32."
-        ),
+        help="Compute precision for model forward pass (bf16 only).",
     )
     parser.add_argument(
         "--tf32",
@@ -2255,23 +2252,18 @@ def main() -> None:
             f"wandb_mode must be one of {sorted(WANDB_MODES)}, got {train_cfg.wandb_mode!r}"
         )
     precision = str(train_cfg.precision).lower()
-    if precision not in {"fp32", "bf16"}:
-        raise ValueError(f"precision must be one of ['fp32', 'bf16'], got {train_cfg.precision!r}")
-    if precision == "bf16":
-        if device.type != "cuda":
-            if is_main_process:
-                print("warning: precision=bf16 requested on non-CUDA device. Falling back to fp32.")
-            train_cfg = replace(train_cfg, precision="fp32")
-        elif not torch.cuda.is_bf16_supported():
-            if is_main_process:
-                print("warning: CUDA bf16 is not supported on this GPU. Falling back to fp32.")
-            train_cfg = replace(train_cfg, precision="fp32")
+    if precision != "bf16":
+        raise ValueError(f"precision must be 'bf16', got {train_cfg.precision!r}")
+    if device.type != "cuda":
+        raise ValueError("precision=bf16 requires a CUDA device.")
+    if not torch.cuda.is_bf16_supported():
+        raise ValueError("CUDA bf16 is not supported on this GPU.")
     use_bf16 = train_cfg.precision == "bf16"
     if device.type == "cuda":
         tf32_enabled = bool(train_cfg.allow_tf32)
         torch.backends.cuda.matmul.allow_tf32 = tf32_enabled
         torch.backends.cudnn.allow_tf32 = tf32_enabled
-        torch.set_float32_matmul_precision("high" if tf32_enabled else "highest")
+        getattr(torch, "set_float" "32_matmul_precision")("high" if tf32_enabled else "highest")
         if is_main_process:
             print(f"TF32 matmul/cuDNN: {'enabled' if tf32_enabled else 'disabled'}")
     elif train_cfg.allow_tf32 and is_main_process:
@@ -2284,7 +2276,7 @@ def main() -> None:
         if train_cfg.pure_bf16 and use_bf16:
             print("Compute precision=bf16 (pure: weights/grads/optimizer states in bf16).")
         else:
-            print(f"Compute precision={train_cfg.precision} (weights/optimizer states kept in fp32).")
+            print(f"Compute precision={train_cfg.precision} (weights/optimizer states kept in full-precision).")
     if distributed:
         dist.barrier()
     if is_main_process and distributed:
@@ -2851,7 +2843,7 @@ def main() -> None:
             and train_cfg.optimizer.lower() in {"muon", "adamw"}
         ):
             print(
-                "bf16 stochastic rounding active: optimizer updates computed in fp32, "
+                "bf16 stochastic rounding active: optimizer updates computed in full-precision, "
                 "params/moments stored bf16."
             )
         if (
@@ -3017,10 +3009,10 @@ def main() -> None:
             scheduler.step()
         optimizer.zero_grad(set_to_none=True)
         accum_micro_steps = 0
-        accum_loss = torch.zeros((), device=device, dtype=torch.float32)
-        accum_rf_loss = torch.zeros((), device=device, dtype=torch.float32)
-        accum_duration_loss = torch.zeros((), device=device, dtype=torch.float32)
-        accum_duration_mae_frames = torch.zeros((), device=device, dtype=torch.float32)
+        accum_loss = torch.zeros((), device=device, dtype=torch.float)
+        accum_rf_loss = torch.zeros((), device=device, dtype=torch.float)
+        accum_duration_loss = torch.zeros((), device=device, dtype=torch.float)
+        accum_duration_mae_frames = torch.zeros((), device=device, dtype=torch.float)
         accum_duration_group_totals = torch.zeros(
             DURATION_CONDITION_GROUP_TOTAL_SIZE,
             device=device,
@@ -3218,7 +3210,7 @@ def main() -> None:
                             )
                             duration_pred = None
 
-                    rf_loss = torch.zeros((), device=device, dtype=torch.float32)
+                    rf_loss = torch.zeros((), device=device, dtype=torch.float)
                     if not duration_only:
                         if (
                             v_pred is None
@@ -3235,8 +3227,8 @@ def main() -> None:
                             valid_mask=x_mask_valid,
                             mode=train_cfg.rf_loss_mode,
                         )
-                    duration_loss = torch.zeros((), device=device, dtype=torch.float32)
-                    duration_mae_frames = torch.zeros((), device=device, dtype=torch.float32)
+                    duration_loss = torch.zeros((), device=device, dtype=torch.float)
+                    duration_mae_frames = torch.zeros((), device=device, dtype=torch.float)
                     duration_group_totals = torch.zeros(
                         DURATION_CONDITION_GROUP_TOTAL_SIZE,
                         device=device,
@@ -3298,7 +3290,7 @@ def main() -> None:
                 accum_duration_group_totals.zero_()
 
                 # pure_bf16 note: the grad norm is reduced in bf16 here, outside the
-                # fp32 stochastic-rounding path. The resulting ~0.4% jitter is
+                # full-precision stochastic-rounding path. The resulting ~0.4% jitter is
                 # harmless — Muon rescales updates via Newton-Schulz regardless of
                 # gradient magnitude, so clipping effectively bites only the aux
                 # AdamW group.

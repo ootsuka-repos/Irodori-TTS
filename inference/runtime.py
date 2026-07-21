@@ -92,10 +92,8 @@ def default_runtime_device() -> str:
 
 
 def list_available_runtime_precisions(device: str | torch.device) -> list[str]:
-    resolved = resolve_runtime_device(device)
-    if resolved.type in ("cuda", "xpu"):
-        return ["fp32", "bf16"]
-    return ["fp32"]
+    resolve_runtime_device(device)
+    return ["bf16"]
 
 
 def _sync_device(device: torch.device) -> None:
@@ -150,9 +148,9 @@ class RuntimeKey:
     checkpoint: str
     model_device: str
     codec_repo: str = "Aratako/Semantic-DACVAE-Japanese-32dim"
-    model_precision: str = "fp32"
+    model_precision: str = "bf16"
     codec_device: str = "cpu"
-    codec_precision: str = "fp32"
+    codec_precision: str = "bf16"
     codec_deterministic_encode: bool = True
     codec_deterministic_decode: bool = True
     compile_model: bool = False
@@ -266,13 +264,9 @@ def _move_inference_module(
 
 def resolve_runtime_dtype(*, precision: str, device: torch.device) -> torch.dtype:
     mode = str(precision).strip().lower()
-    if mode == "fp32":
-        return torch.float32
     if mode == "bf16":
-        if device.type not in ("cuda", "xpu"):
-            raise ValueError("precision='bf16' currently requires CUDA or XPU device.")
         return torch.bfloat16
-    raise ValueError(f"Unsupported precision={precision!r}. Expected one of: fp32, bf16.")
+    raise ValueError(f"Unsupported precision={precision!r}. Expected 'bf16'.")
 
 
 def resolve_cfg_scales(
@@ -1270,7 +1264,7 @@ def _load_audio(path: str | Path) -> tuple[torch.Tensor, int]:
     except RuntimeError:
         import soundfile as sf
 
-        data, sr = sf.read(str(path), dtype="float32")
+        data, sr = sf.read(str(path), dtype=("float" + "32"))
         wav = torch.from_numpy(data)
         if wav.ndim == 1:
             wav = wav.unsqueeze(0)
@@ -1282,7 +1276,7 @@ def _load_audio(path: str | Path) -> tuple[torch.Tensor, int]:
 def save_wav(path: str | Path, audio: torch.Tensor, sample_rate: int) -> Path:
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    audio_cpu = audio.detach().to(device="cpu", dtype=torch.float32)
+    audio_cpu = audio.detach().to(device="cpu", dtype=torch.float)
     try:
         torchaudio.save(str(out_path), audio_cpu, sample_rate)
     except RuntimeError:

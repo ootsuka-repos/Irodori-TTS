@@ -1,0 +1,30 @@
+﻿# ============================================================================
+# データセット全再作成（prepare_all — 6ステージ再開可能・キャッシュ済みは自動スキップ）
+#   対象: dataset\collected\<データセット名>\source の音源
+#   出力: 同ディレクトリ配下の pipeline（work dir・クリップFLAC・VADキャッシュ）
+#         manifests\train.jsonl（publishで原子的置換） / latents\clips_<key>（bf16）
+#   latentはbf16でエンコードされる（core/codec.py のデフォルトdtype +
+#   prepare_all.py LATENT_ENCODE_PARAMS の encode_dtype キー）
+#
+#   途中で止めても再実行すればキャッシュから続行（VAD/クリップ/ASR/校正すべて）。
+#   ステージ: speech → nonverbal → transcribe → context_correction → latents → publish
+#   部分実行: --start-at <stage> / --stop-after <stage> / --force-stage <stage> / --dry-run
+#   Grok校正は ~/.grok にサブスクログイン済みであること（モデルは grok-4.5 ピン留め）
+#   --gpus: 両GPU使用は "all"（latentの2GPU分散はGPU 0始まりの連番が必要）。
+#           GPU0をTTS学習等で使用中のときだけ "1"（パイプラインとFT学習の同時実行は非推奨）
+#   フォアグラウンド実行（コンソールにログ表示、Ctrl+Cで停止）
+# ============================================================================
+
+# --- オナニー1 ---
+& .\.venv\Scripts\python.exe -m dataset.cli.prepare_all --data-root dataset\collected\オナニー1\source --work-dir dataset\collected\オナニー1\pipeline --manifest-dir dataset\collected\オナニー1\manifests --latent-root dataset\collected\オナニー1\latents --gpus all --speech-shards 48
+
+# --- シチュボ1 ---
+& .\.venv\Scripts\python.exe -m dataset.cli.prepare_all --data-root dataset\collected\シチュボ1\source --work-dir dataset\collected\シチュボ1\pipeline --manifest-dir dataset\collected\シチュボ1\manifests --latent-root dataset\collected\シチュボ1\latents --gpus all --speech-shards 48
+
+# --- シチュボ2 ---
+& .\.venv\Scripts\python.exe -m dataset.cli.prepare_all --data-root dataset\collected\シチュボ2\source --work-dir dataset\collected\シチュボ2\pipeline --manifest-dir dataset\collected\シチュボ2\manifests --latent-root dataset\collected\シチュボ2\latents --gpus all --speech-shards 48
+
+# 進捗確認（別コンソールから）:
+#   Get-Content dataset\collected\オナニー1\pipeline\full_pipeline\logs\speech.log -Tail 20
+# ステージ状態:
+#   Get-Content dataset\collected\オナニー1\pipeline\full_pipeline\state.json

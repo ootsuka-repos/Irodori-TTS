@@ -59,7 +59,7 @@ def ffmpeg_excerpt(path: Path, offset: float, seconds: float) -> np.ndarray:
         ],
         capture_output=True,
     )
-    return np.frombuffer(out.stdout, dtype=np.float32).copy()
+    return np.frombuffer(out.stdout, dtype=np.single).copy()
 
 
 class ExcerptDataset(Dataset):
@@ -153,6 +153,9 @@ def main() -> None:
     parser.add_argument("--lambda-adv", type=float, default=1.0)
     parser.add_argument("--lambda-feat", type=float, default=2.0)
     parser.add_argument("--normalize-db", type=float, default=-16.0)
+    parser.add_argument("--amp", choices=["off", "bf16", "pure-bf16"], default="pure-bf16",
+                        help="off=単精度 / bf16=autocastのみ（重み単精度） / "
+                        "pure-bf16=学習対象の重み・optimizer状態もbf16（stochastic rounding付き、最速）")
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--save-every", type=int, default=1000)
@@ -217,7 +220,13 @@ def main() -> None:
     n_train = sum(p.numel() for p in gen_params)
     print(f"[model] trainable decoder params: {n_train/1e6:.1f}M", flush=True)
 
+    pure_bf16 = args.amp == "pure-bf16"
+    if pure_bf16:
+        model.to(torch.bfloat16)
+
     disc = Discriminator(sample_rate=SAMPLE_RATE).to(device)
+    if pure_bf16:
+        disc.to(torch.bfloat16)
     disc_ckpt = args.output_dir / "discriminator_last.pt"
     start_step = 0
     state_path = args.output_dir / "train_state.json"
@@ -239,8 +248,13 @@ def main() -> None:
     stft_loss = MultiScaleSTFTLoss()
     gan_loss = GANLoss(disc)
 
-    opt_g = torch.optim.AdamW(gen_params, lr=args.gen_lr, betas=(0.8, 0.99))
-    opt_d = torch.optim.AdamW(disc.parameters(), lr=args.disc_lr, betas=(0.8, 0.99))
+    if pure_bf16:
+        from train.optim import AdamWBF16SR
+        opt_g = AdamWBF16SR(gen_params, lr=args.gen_lr, betas=(0.8, 0.99))
+        opt_d = AdamWBF16SR(disc.parameters(), lr=args.disc_lr, betas=(0.8, 0.99))
+    else:
+        opt_g = torch.optim.AdamW(gen_params, lr=args.gen_lr, betas=(0.8, 0.99))
+        opt_d = torch.optim.AdamW(disc.parameters(), lr=args.disc_lr, betas=(0.8, 0.99))
     sched_g = torch.optim.lr_scheduler.ExponentialLR(opt_g, gamma=args.lr_gamma)
     sched_d = torch.optim.lr_scheduler.ExponentialLR(opt_d, gamma=args.lr_gamma)
 
@@ -251,20 +265,30 @@ def main() -> None:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         persistent_workers=args.num_workers > 0,
+        pin_memory=True,
+        prefetch_factor=4 if args.num_workers > 0 else None,
         drop_last=True,
     )
+    use_amp = args.amp in ("bf16", "pure-bf16")
 
     sample_latents = [Path(p) for p in (args.sample_latents or [])]
+    missing_samples = [p for p in sample_latents if not p.exists()]
+    if missing_samples:
+        for p in missing_samples:
+            print(f"[warn] sample latent not found, skipping: {p}", flush=True)
+        sample_latents = [p for p in sample_latents if p.exists()]
 
     def save_checkpoint(step: int) -> None:
+        # 重みはbf16のまま保存（ロード側のload_state_dictがモデル構築時のdtypeへキャストするため互換）
         weights_path = args.output_dir / "weights_ft.pth"
         model.save(str(weights_path), package=False)
         torch.save(disc.state_dict(), disc_ckpt)
         state_path.write_text(json.dumps({"step": step}), encoding="utf-8")
         model.decoder.eval()
+        model_dtype = next(model.parameters()).dtype
         with torch.inference_mode():
             for lp in sample_latents:
-                latent = torch.load(lp, map_location=device).float().t().unsqueeze(0)  # (T,D)→(1,D,T)
+                latent = torch.load(lp, map_location=device).t().unsqueeze(0).to(model_dtype)  # (T,D)→(1,D,T)
                 audio = decode_body(model, latent)
                 out_wav = args.output_dir / f"sample_{lp.stem}_step{step}.wav"
                 torchaudio.save(str(out_wav), audio[0].cpu().float(), SAMPLE_RATE)
@@ -276,16 +300,18 @@ def main() -> None:
     for batch in loader:
         if step >= args.steps:
             break
-        wav = normalize_batch(batch, args.normalize_db).to(device)  # (B,1,T)
-        latent = encode_deterministic(model, wav)
-        fake = decode_body(model, latent)
-        n = min(fake.shape[-1], wav.shape[-1])
-        fake_sig = AudioSignal(fake[..., :n], SAMPLE_RATE)
-        real_sig = AudioSignal(wav[..., :n], SAMPLE_RATE)
+        wav = normalize_batch(batch, args.normalize_db).to(device, non_blocking=True)  # (B,1,T)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+            latent = encode_deterministic(model, wav)
+            fake = decode_body(model, latent)
+            n = min(fake.shape[-1], wav.shape[-1])
+            fake_sig = AudioSignal(fake[..., :n], SAMPLE_RATE)
+            real_sig = AudioSignal(wav[..., :n], SAMPLE_RATE)
 
         # discriminator
         opt_d.zero_grad(set_to_none=True)
-        loss_d = gan_loss.discriminator_loss(fake_sig, real_sig)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+            loss_d = gan_loss.discriminator_loss(fake_sig, real_sig)
         loss_d.backward()
         torch.nn.utils.clip_grad_norm_(disc.parameters(), 10.0)
         opt_d.step()
@@ -293,15 +319,16 @@ def main() -> None:
 
         # generator
         opt_g.zero_grad(set_to_none=True)
-        l_mel = mel_loss(fake_sig, real_sig)
-        l_stft = stft_loss(fake_sig, real_sig)
-        l_adv, l_feat = gan_loss.generator_loss(fake_sig, real_sig)
-        loss_g = (
-            args.lambda_mel * l_mel
-            + args.lambda_stft * l_stft
-            + args.lambda_adv * l_adv
-            + args.lambda_feat * l_feat
-        )
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+            l_mel = mel_loss(fake_sig, real_sig)
+            l_stft = stft_loss(fake_sig, real_sig)
+            l_adv, l_feat = gan_loss.generator_loss(fake_sig, real_sig)
+            loss_g = (
+                args.lambda_mel * l_mel
+                + args.lambda_stft * l_stft
+                + args.lambda_adv * l_adv
+                + args.lambda_feat * l_feat
+            )
         loss_g.backward()
         torch.nn.utils.clip_grad_norm_(gen_params, 1e3)
         opt_g.step()

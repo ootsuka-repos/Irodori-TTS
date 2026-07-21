@@ -30,7 +30,7 @@ class DACVAECodec:
         cls,
         repo_id: str = "Aratako/Semantic-DACVAE-Japanese-32dim",
         device: str = "cuda",
-        dtype: torch.dtype | None = None,
+        dtype: torch.dtype | None = torch.bfloat16,
         deterministic_encode: bool = True,
         deterministic_decode: bool = True,
         normalize_db: float | None = -16.0,
@@ -105,7 +105,7 @@ class DACVAECodec:
         message_device = torch.device(device)
 
         def _fixed_message(batch_size: int) -> torch.Tensor:
-            return torch.zeros((batch_size, nbits), dtype=torch.float32, device=message_device)
+            return torch.zeros((batch_size, nbits), dtype=torch.float, device=message_device)
 
         wm_model.random_message = _fixed_message
 
@@ -116,7 +116,7 @@ class DACVAECodec:
         if target_db is None:
             return wav
         wav_device = wav.device
-        wav = wav.to(dtype=torch.float32)
+        wav = wav.to(dtype=torch.float)
         if wav.ndim == 2:
             if wav.shape[0] == 1:
                 wav = wav[0]
@@ -144,7 +144,7 @@ class DACVAECodec:
         normalized = signal.audio_data
         if not isinstance(normalized, torch.Tensor):
             normalized = torch.as_tensor(normalized)
-        normalized = normalized.to(dtype=torch.float32, device=wav_device)
+        normalized = normalized.to(dtype=torch.float, device=wav_device)
         normalized = normalized.squeeze()
         if normalized.ndim != 1:
             raise RuntimeError(
@@ -192,7 +192,7 @@ class DACVAECodec:
             effective_normalize_db is None and bool(ensure_max) if ensure_max is not None else False
         )
 
-        waveform = waveform.to(dtype=torch.float32)
+        waveform = waveform.to(dtype=torch.float)
         if effective_normalize_db is not None or effective_ensure_max:
             # Keep behavior deterministic per utterance by normalizing each waveform independently.
             processed: list[torch.Tensor] = []

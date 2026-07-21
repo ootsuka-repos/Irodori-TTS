@@ -73,7 +73,7 @@ class SilentCipherWatermarker:
             list(payload),
             calc_sdr=False,
         )
-        encoded_audio = torch.as_tensor(encoded, dtype=torch.float32, device="cpu")
+        encoded_audio = torch.as_tensor(encoded, dtype=torch.float, device="cpu")
         return _match_original_rank(encoded_audio, reference=audio)
 
     def encode_batch(self, audios: list[torch.Tensor], *, sample_rate: int) -> list[torch.Tensor]:

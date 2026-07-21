@@ -186,7 +186,7 @@ def _align_frames(values: torch.Tensor, frames: int) -> torch.Tensor:
     if int(values.numel()) >= frames:
         return values[:frames]
     if values.numel() == 0:
-        return torch.full((frames,), -120.0, dtype=torch.float32, device=values.device)
+        return torch.full((frames,), -120.0, dtype=torch.float, device=values.device)
     extension = values[-1].expand(frames - int(values.numel()))
     return torch.cat((values, extension))
 
@@ -201,7 +201,7 @@ def extract_acoustic_features(
     config = config or AcousticSegmentationConfig()
     _validate_waveform(waveform, sample_rate)
     if waveform.numel() == 0:
-        empty = torch.empty(0, dtype=torch.float32, device=waveform.device)
+        empty = torch.empty(0, dtype=torch.float, device=waveform.device)
         return AcousticFrameFeatures(
             log_mel_db=empty.reshape(config.n_mels, 0),
             rms_dbfs=empty,
@@ -211,7 +211,7 @@ def extract_acoustic_features(
             hop_seconds=config.hop_seconds,
         )
 
-    analysis = waveform.detach().to(dtype=torch.float32)
+    analysis = waveform.detach().to(dtype=torch.float)
     if sample_rate != config.analysis_sample_rate:
         analysis = torchaudio.functional.resample(
             analysis,

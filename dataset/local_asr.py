@@ -55,8 +55,8 @@ class AnimeWhisperConfig:
             raise ValueError("batch_size must be positive")
         if not math.isfinite(self.chunk_length_seconds) or self.chunk_length_seconds <= 0:
             raise ValueError("chunk_length_seconds must be positive and finite")
-        if self.dtype not in {"float16", "bfloat16", "float32"}:
-            raise ValueError("dtype must be float16, bfloat16, or float32")
+        if self.dtype not in {"float16", "bfloat16"}:
+            raise ValueError("dtype must be float16 or bfloat16")
 
 
 class AnimeWhisperTranscriber:
@@ -274,7 +274,7 @@ class FasterWhisperTranscriber:
                 else:
                     audio = audio[: extractor.n_samples]
                 features.append(extractor(audio, padding=0)[:, : extractor.nb_max_frames])
-            encoder_output = model.encode(np.stack(features).astype(np.float32))
+            encoder_output = model.encode(np.stack(features).astype(np.single))
             generation = model.model.generate(
                 encoder_output,
                 [prompt] * len(batch),
