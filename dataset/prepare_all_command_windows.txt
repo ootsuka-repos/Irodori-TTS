@@ -16,13 +16,13 @@
 # ============================================================================
 
 # --- オナニー1 ---
-& .\.venv\Scripts\python.exe -m dataset.cli.prepare_all --data-root dataset\collected\オナニー1\source --work-dir dataset\collected\オナニー1\pipeline --manifest-dir dataset\collected\オナニー1\manifests --latent-root dataset\collected\オナニー1\latents --gpus all --speech-shards 48
+& .\.venv\Scripts\python.exe -m dataset.cli.prepare_all --data-root dataset\collected\オナニー1\source --work-dir dataset\collected\オナニー1\pipeline --manifest-dir dataset\collected\オナニー1\manifests --latent-root dataset\collected\オナニー1\latents --gpus all --speech-shards 48 --transcribe-batch-size 12
 
 # --- シチュボ1 ---
-& .\.venv\Scripts\python.exe -m dataset.cli.prepare_all --data-root dataset\collected\シチュボ1\source --work-dir dataset\collected\シチュボ1\pipeline --manifest-dir dataset\collected\シチュボ1\manifests --latent-root dataset\collected\シチュボ1\latents --gpus all --speech-shards 48
+& .\.venv\Scripts\python.exe -m dataset.cli.prepare_all --data-root dataset\collected\シチュボ1\source --work-dir dataset\collected\シチュボ1\pipeline --manifest-dir dataset\collected\シチュボ1\manifests --latent-root dataset\collected\シチュボ1\latents --gpus all --speech-shards 48 --transcribe-batch-size 12
 
 # --- シチュボ2 ---
-& .\.venv\Scripts\python.exe -m dataset.cli.prepare_all --data-root dataset\collected\シチュボ2\source --work-dir dataset\collected\シチュボ2\pipeline --manifest-dir dataset\collected\シチュボ2\manifests --latent-root dataset\collected\シチュボ2\latents --gpus all --speech-shards 48
+& .\.venv\Scripts\python.exe -m dataset.cli.prepare_all --data-root dataset\collected\シチュボ2\source --work-dir dataset\collected\シチュボ2\pipeline --manifest-dir dataset\collected\シチュボ2\manifests --latent-root dataset\collected\シチュボ2\latents --gpus all --speech-shards 48 --transcribe-batch-size 12
 
 # 進捗確認（別コンソールから）:
 #   Get-Content dataset\collected\オナニー1\pipeline\full_pipeline\logs\speech.log -Tail 20
