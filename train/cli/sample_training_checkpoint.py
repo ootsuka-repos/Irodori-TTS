@@ -17,16 +17,10 @@ from inference.runtime import (
 # (name, ref category, text) — the reference clip is picked from the same
 # category so sampling matches the style-matched conditioning used in training.
 SAMPLES = (
-    ("normal", "speech", "先生、今日も一日お疲れ様でした。ゆっくり休んでくださいね。"),
-    ("normal2", "speech", "ねえ、こっち来て？今日は二人きりだから、いっぱい甘えていいんだよ。"),
-    ("aegi", "aegi", "あっ、あっ、んっ……だめ、気持ちいい……！"),
-    ("aegi2", "aegi", "んんっ……はぁ、はぁっ……そこ、だめぇ……っ、あぁんっ……！"),
-    ("aegi3", "aegi", "ひゃうっ……！あっ、待って、んっ、イっちゃう、イっちゃうからぁ……！"),
-    ("aegi4", "aegi", "ふぁ……あぁっ……奥、当たってる……んっ、はぁっ、あっ、あっ……！"),
-    ("chupa", "chupa", "ちゅっ、ちゅるっ、ちゅぱっ……んっ、ちゅぅ……。"),
-    ("chupa2", "chupa", "んちゅ……ちゅぷっ、じゅるっ……はむっ……んんっ、ちゅぱぁ……。"),
-    ("chupa3", "chupa", "れろっ……れろれろっ……ちゅうぅ……んはぁ……じゅぽっ、じゅぽっ……。"),
-    ("chupa4", "chupa", "じゅるるっ……んくっ、んんー……ちゅぱっ、ちゅっ、れろぉ……ぷはぁ……。"),
+    ("normal", "speech", "ん……もうこんなに濡れちゃってる。ねえ、聞こえてる？あなたの声を想像しながら、ゆっくり触るね……"),
+    ("aegi", "aegi", "んっ……はぁ、はぁ……あっ、あぁっ……んんっ、ふぁっ、あっ、あっ……！はぁ、はぁ……"),
+    ("chupa", "chupa", "ちゅ……んちゅ、れろ……じゅるっ……ちゅぱ、ちゅぷ……んんっ、ちゅうぅ……"),
+    ("mixed", "mixed", "指、入れるね……んっ、あぁっ……くちゅくちゅって、音してるの分かる？……はぁ、気持ちいい……"),
 )
 
 _FALLBACK_CATEGORY = "speech"
