@@ -21,7 +21,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description=(
             "Discover source audio, run Silero VAD, and cut padded 5-20 s FLAC "
             "clips plus all/train/review manifests. Text starts empty; the "
-            "anime-whisper stage supplies transcripts."
+            "transcribe stage supplies transcripts."
         )
     )
     parser.add_argument("--input-dir", type=Path, default=Path("dataset/data"))

@@ -35,8 +35,8 @@ train:
   # epoch, but one batched fwd/bwd instead of four tiny ones. Length bucketing
   # keeps padding waste near zero, and stratified timestep sampling actually
   # stratifies at batch>1.
-  batch_size: 4
-  gradient_accumulation_steps: 1
+  batch_size: 8
+  gradient_accumulation_steps: 4
   length_bucketing: true
   length_bucket_mult: 64
   # Resample with replacement so speech/mixed/aegi/chupa are drawn with equal
@@ -60,6 +60,14 @@ train:
   allow_tf32: true
   compile_model: false
   precision: bf16
+  # No fp32 master weights: params/grads/Muon momentum all bf16 (~half the VRAM
+  # of fp32 masters). EMA shadow stays fp32 on CPU (train/ema.py).
+  pure_bf16: true
+  # Optimizer steps compute in fp32 and store bf16 with stochastic rounding.
+  # Without it, updates below half a bf16 ulp and all weight-decay multiplies
+  # round back to the old value and are lost. Applies to the optimizer step
+  # only; grad accumulation and clip stay bf16-nearest (harmless).
+  bf16_stochastic_round: true
   # adamw8bit -> muon: orthogonalized updates on hidden matrices converge
   # faster per step; embeddings/norms/output heads stay on AdamW. On resume
   # from an adamw8bit checkpoint the stored optimizer state is incompatible;

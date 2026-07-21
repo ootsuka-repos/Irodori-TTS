@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Correct Grok STT and anime-whisper text with shared temporal context."""
+"""Correct Grok STT and whisper-ja transcript text with shared temporal context."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ def _parse_priority(value: str) -> tuple[str, ...]:
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Correct both Grok STT and anime-whisper results in overlapping temporal "
+            "Correct both Grok STT and whisper-ja transcript results in overlapping temporal "
             "context windows. Codex, Claude, then Grok CLI are tried by default."
         )
     )

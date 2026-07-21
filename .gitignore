@@ -216,8 +216,13 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Runtime artifacts: all generated outputs live under outputs/, all dataset
-# intermediates (manifests, latents, source/training audio) under dataset/data/.
+# manifests / latents / source audio live under dataset/ data dirs. None of
+# these large binaries are committed. dataset/collected/ holds the consolidated
+# per-collection datasets (シチュボ1 / シチュボ2 / オナニー1); data/ and data2/
+# are legacy pipeline work dirs kept ignored in case they are recreated.
 outputs/
 dataset/data/
+dataset/data2/
+dataset/collected/
 
 .claude/

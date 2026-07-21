@@ -183,7 +183,7 @@ def _build_timeline(
                 backend = str(row.get("asr_backend", "grok-stt") or "grok-stt")
             else:
                 raw = row.get("transcript_text_raw", row.get("transcript_text", ""))
-                backend = str(row.get("transcript_backend", "anime-whisper") or "anime-whisper")
+                backend = str(row.get("transcript_backend", "faster-whisper") or "faster-whisper")
             text = normalize_transcript(str(raw or ""))
             if not text:
                 continue

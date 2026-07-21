@@ -507,7 +507,7 @@ def transcribe_manifest_rows(
             )
             completed += 1
         print(
-            f"anime-whisper rows={completed}/{len(pending)} "
+            f"transcribe rows={completed}/{len(pending)} "
             f"cached={cache_hits} audio_errors={audio_errors}",
             flush=True,
         )

@@ -2,7 +2,7 @@
 
 Replaces the former Grok STT module. Sources are scanned, Silero VAD detects
 speech, nearby utterances are packed into 5-20 s clips, and FLAC clips plus
-train/review manifests are written. Text starts empty; the anime-whisper stage
+train/review manifests are written. Text starts empty; the transcribe stage
 fills it, and the Grok CLI is used later only as a plain LLM text corrector.
 
 The per-source VAD cache (``vad_responses/{source_id}.json``) keeps the same

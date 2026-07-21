@@ -28,7 +28,7 @@ python -m inference.cli.convert_checkpoint <ckpt.pt> --use-ema
 
 1. **speech** (`speech_pipeline.py`): Silero VAD → 発話を**5〜20秒**にパック → FLACクリップ + `all.jsonl`（text空）。動的プロセスプール24並列（CPUバウンド）。VAD結果は `vad_responses/*.json` にキャッシュ（キーに `speech_pad_ms` 等のVAD設定を含む — nonverbal側と**同一設定必須**）
 2. **nonverbal** (`nonverbal_pipeline.py`): VADが拾わなかったギャップ（≥5秒）を `acoustic_segmentation.py` の自然境界で切り、無音除去して5〜20秒イベントクリップ化。行形式はspeechと同一（`origin: vad_complement`）。囁き・喘ぎ・フェラ音がここから回収される
-3. **anime_whisper**: speech+nonverbalを1本に連結（`all_clips.jsonl`）し、faster-whisper + `TransWithAI/whisper-ja-1.5B-ct2` で文字起こし。**CT2直叩きのクロスクリップバッチ推論**（`local_asr.FasterWhisperTranscriber`、反復抑制: repetition_penalty 1.1 + condition_on_previous_text=False）。GPUあたり2ワーカー×バッチ16をシャード分割（`--shard-index/count`）→ID順マージ
+3. **transcribe**（旧称 anime_whisper）: speech+nonverbalを1本に連結（`all_clips.jsonl`）し、faster-whisper + `TransWithAI/whisper-ja-1.5B-ct2` で文字起こし。**CT2直叩きのクロスクリップバッチ推論**（`local_asr.FasterWhisperTranscriber`、反復抑制: repetition_penalty 1.1 + condition_on_previous_text=False）。GPUあたり2ワーカー×バッチ16をシャード分割（`--shard-index/count`）→ID順マージ
 4. **context_correction** (`transcript_correction.py`): Grok-4.5が同一音源タイムライン文脈で校正+**カテゴリ分類**。`category ∈ {speech, aegi, chupa, mixed, other}` が唯一のラベル権威。`other`（ノイズ）はreview行き。安全ゲート（類似度・長さ比）を通らない修正は棄却。バッチ結果は `text_correction/` にキャッシュ。並列128が実績上限（**256はgrok CLIがタイムアウト連鎖で崩壊**、timeout 600s）。出力は `all_corrected.jsonl` / `train.jsonl` / `review.jsonl`（入力の`all.jsonl`は上書きしない）
 5. **latents**: `prepare_manifest` がDACVAEエンコード（2GPU分散、`category`/`cluster_token` フィールドをパススルー）
 6. **publish**: `manifest_merge.py` で検証（latent重複・ID重複・実在）→ `dataset/data/manifests/train.jsonl` へ原子的置換（旧版は `train_before_full_*` にバックアップ）

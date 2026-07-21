@@ -30,14 +30,14 @@ PIPELINE_SCHEMA_VERSION = 1
 STAGES = (
     "speech",
     "nonverbal",
-    "anime_whisper",
+    "transcribe",
     "context_correction",
     "latents",
     "publish",
 )
 # Stages that need CUDA; preflight only requires a GPU when one of these is in
 # the selected --start-at/--stop-after range. The nonverbal stage is pure CPU.
-GPU_STAGES = frozenset({"speech", "anime_whisper", "latents"})
+GPU_STAGES = frozenset({"speech", "transcribe", "latents"})
 # Everything that determines latent content. Part of the _latent_one cache key
 # and the latents stage fingerprint so changed encode settings invalidate
 # previously generated latents instead of silently reusing them.
@@ -466,7 +466,7 @@ class PipelineRunner:
         base = [
             sys.executable,
             "-m",
-            "dataset.cli.prepare_anime_whisper",
+            "dataset.cli.prepare_transcribe",
             "--input-manifest",
             str(input_manifest),
             "--audio-root",
@@ -474,7 +474,7 @@ class PipelineRunner:
             "--cache-dir",
             str(cache_dir),
             "--batch-size",
-            str(self.args.anime_batch_size),
+            str(self.args.transcribe_batch_size),
         ]
         if replace_text:
             base.append("--replace-text")
@@ -482,7 +482,7 @@ class PipelineRunner:
         worker_count = len(gpus) * max(1, int(self.args.asr_workers_per_gpu))
         if worker_count == 1:
             command = [*base, "--device", f"cuda:{gpus[0]}", "--output-manifest", str(output_manifest)]
-            self.run_command(f"anime_whisper_{label}", command)
+            self.run_command(f"transcribe_{label}", command)
             return
         shard_paths: list[Path] = []
         jobs: list[tuple[str, list[str]]] = []
@@ -492,7 +492,7 @@ class PipelineRunner:
             shard_paths.append(shard_path)
             jobs.append(
                 (
-                    f"anime_whisper_{label}_gpu{gpu}",
+                    f"transcribe_{label}_gpu{gpu}",
                     [
                         *base,
                         "--device",
@@ -514,7 +514,7 @@ class PipelineRunner:
         for shard in shard_paths:
             shard.unlink(missing_ok=True)
 
-    def anime_whisper(self) -> None:
+    def transcribe(self) -> None:
         speech_source = self.work_dir / "all.jsonl"
         nonverbal_source = self.work_dir / "nonverbal_events.jsonl"
         combined = self.work_dir / "all_clips.jsonl"
@@ -550,7 +550,7 @@ class PipelineRunner:
             )
 
         self.run_stage(
-            "anime_whisper",
+            "transcribe",
             fingerprint=fingerprint,
             outputs=(combined, output),
             action=action,
@@ -811,7 +811,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Fully automate local VAD segmentation, nonverbal GPU inference, "
-            "anime-whisper transcription, contextual LLM correction, DACVAE "
+            "whisper-ja transcription, contextual LLM correction, DACVAE "
             "latents, and atomic publication. No cloud STT is involved."
         )
     )
@@ -845,7 +845,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "Each worker batches clips through CTranslate2 (~5GB VRAM each)."
         ),
     )
-    parser.add_argument("--anime-batch-size", type=int, default=16)
+    parser.add_argument(
+        "--transcribe-batch-size",
+        "--anime-batch-size",
+        dest="transcribe_batch_size",
+        type=int,
+        default=16,
+        help="Cross-clip ASR batch size for the transcribe stage (alias: --anime-batch-size).",
+    )
     parser.add_argument("--audio-padding-seconds", type=float, default=0.35)
     parser.add_argument("--audio-padding-ms", type=int, default=350)
     parser.add_argument("--correction-agents", default="grok")
@@ -884,7 +891,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     for name in (
-        "anime_batch_size",
+        "transcribe_batch_size",
         "correction_batch_size",
         "correction_workers",
     ):
