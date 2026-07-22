@@ -292,6 +292,9 @@ def main() -> None:
         model.decoder.eval()
         with torch.inference_mode():
             for lp in sample_latents:
+                if not lp.exists():
+                    print(f"[save] sample latent not found, skipping: {lp}", flush=True)
+                    continue
                 latent = torch.load(lp, map_location=device).float().t().unsqueeze(0)  # (T,D)→(1,D,T)
                 audio = decode_body(model, latent)
                 out_wav = args.output_dir / f"sample_{lp.stem}_step{step}.wav"
