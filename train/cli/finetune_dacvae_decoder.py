@@ -78,21 +78,32 @@ class ExcerptDataset(Dataset):
         return self.virtual_len
 
     def __getitem__(self, index: int) -> torch.Tensor:
-        rng = random.Random(self.seed * 1_000_003 + index)
-        seconds = self.excerpt_samples / SAMPLE_RATE
-        for _ in range(6):
-            fi = rng.choices(range(len(self.files)), weights=self.probs, k=1)[0]
-            path, dur = self.files[fi]
-            if dur <= seconds + 1.0:
-                continue
-            offset = rng.uniform(0.5, dur - seconds - 0.5)
-            wav = ffmpeg_excerpt(Path(path), offset, seconds)
-            if wav.shape[0] < self.excerpt_samples:
-                continue
-            wav = wav[: self.excerpt_samples]
-            if float(np.sqrt(np.mean(wav**2))) > 1e-3:
-                return torch.from_numpy(wav)
-        return torch.from_numpy(np.pad(wav, (0, max(0, self.excerpt_samples - wav.shape[0]))))
+        # 例外でワーカーが死ぬとWindowsでは共有メモリ経由の復旧ができず学習全体が
+        # 落ちるため、どんな失敗でも必ずTensorを返す
+        try:
+            rng = random.Random(self.seed * 1_000_003 + index)
+            seconds = self.excerpt_samples / SAMPLE_RATE
+            last: np.ndarray | None = None
+            for _ in range(6):
+                fi = rng.choices(range(len(self.files)), weights=self.probs, k=1)[0]
+                path, dur = self.files[fi]
+                if dur <= seconds + 1.0:
+                    continue
+                offset = rng.uniform(0.5, dur - seconds - 0.5)
+                wav = ffmpeg_excerpt(Path(path), offset, seconds)
+                if wav.shape[0] < self.excerpt_samples:
+                    last = wav
+                    continue
+                wav = wav[: self.excerpt_samples]
+                if float(np.sqrt(np.mean(wav**2))) > 1e-3:
+                    return torch.from_numpy(wav)
+                last = wav
+            if last is None:
+                last = np.zeros(self.excerpt_samples, dtype=np.float32)
+            return torch.from_numpy(np.pad(last, (0, max(0, self.excerpt_samples - last.shape[0]))))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[data] worker error at index={index}: {exc!r} -> zero excerpt", flush=True)
+            return torch.zeros(self.excerpt_samples, dtype=torch.float32)
 
 
 def normalize_batch(wav: torch.Tensor, target_db: float) -> torch.Tensor:
@@ -255,14 +266,21 @@ def main() -> None:
     sched_d = torch.optim.lr_scheduler.ExponentialLR(opt_d, gamma=args.lr_gamma)
 
     excerpt_samples = args.excerpt_frames * HOP
-    dataset = ExcerptDataset(entries, excerpt_samples, virtual_len=args.steps * args.batch_size, seed=args.seed + start_step)
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        persistent_workers=args.num_workers > 0,
-        drop_last=True,
-    )
+
+    def make_loader(current_step: int) -> DataLoader:
+        dataset = ExcerptDataset(
+            entries,
+            excerpt_samples,
+            virtual_len=(args.steps - current_step) * args.batch_size,
+            seed=args.seed + current_step,
+        )
+        return DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            persistent_workers=args.num_workers > 0,
+            drop_last=True,
+        )
 
     sample_latents = [Path(p) for p in (args.sample_latents or [])]
 
@@ -283,50 +301,58 @@ def main() -> None:
 
     step = start_step
     running: dict[str, float] = {}
-    for batch in loader:
-        if step >= args.steps:
-            break
-        wav = normalize_batch(batch, args.normalize_db).to(device)  # (B,1,T)
-        latent = encode_deterministic(model, wav)
-        fake = decode_body(model, latent)
-        n = min(fake.shape[-1], wav.shape[-1])
-        fake_sig = AudioSignal(fake[..., :n], SAMPLE_RATE)
-        real_sig = AudioSignal(wav[..., :n], SAMPLE_RATE)
+    while step < args.steps:
+        loader = make_loader(step)
+        try:
+          for batch in loader:
+              if step >= args.steps:
+                  break
+              wav = normalize_batch(batch, args.normalize_db).to(device)  # (B,1,T)
+              latent = encode_deterministic(model, wav)
+              fake = decode_body(model, latent)
+              n = min(fake.shape[-1], wav.shape[-1])
+              fake_sig = AudioSignal(fake[..., :n], SAMPLE_RATE)
+              real_sig = AudioSignal(wav[..., :n], SAMPLE_RATE)
 
-        # discriminator
-        opt_d.zero_grad(set_to_none=True)
-        loss_d = gan_loss.discriminator_loss(fake_sig, real_sig)
-        loss_d.backward()
-        torch.nn.utils.clip_grad_norm_(disc.parameters(), 10.0)
-        opt_d.step()
-        sched_d.step()
+              # discriminator
+              opt_d.zero_grad(set_to_none=True)
+              loss_d = gan_loss.discriminator_loss(fake_sig, real_sig)
+              loss_d.backward()
+              torch.nn.utils.clip_grad_norm_(disc.parameters(), 10.0)
+              opt_d.step()
+              sched_d.step()
 
-        # generator
-        opt_g.zero_grad(set_to_none=True)
-        l_mel = mel_loss(fake_sig, real_sig)
-        l_stft = stft_loss(fake_sig, real_sig)
-        l_adv, l_feat = gan_loss.generator_loss(fake_sig, real_sig)
-        loss_g = (
-            args.lambda_mel * l_mel
-            + args.lambda_stft * l_stft
-            + args.lambda_adv * l_adv
-            + args.lambda_feat * l_feat
-        )
-        loss_g.backward()
-        torch.nn.utils.clip_grad_norm_(gen_params, 1e3)
-        opt_g.step()
-        sched_g.step()
+              # generator
+              opt_g.zero_grad(set_to_none=True)
+              l_mel = mel_loss(fake_sig, real_sig)
+              l_stft = stft_loss(fake_sig, real_sig)
+              l_adv, l_feat = gan_loss.generator_loss(fake_sig, real_sig)
+              loss_g = (
+                  args.lambda_mel * l_mel
+                  + args.lambda_stft * l_stft
+                  + args.lambda_adv * l_adv
+                  + args.lambda_feat * l_feat
+              )
+              loss_g.backward()
+              torch.nn.utils.clip_grad_norm_(gen_params, 1e3)
+              opt_g.step()
+              sched_g.step()
 
-        step += 1
-        for k, v in {"mel": l_mel, "stft": l_stft, "adv": l_adv, "feat": l_feat, "disc": loss_d}.items():
-            running[k] = running.get(k, 0.0) + float(v.detach())
-        if step % args.log_every == 0:
-            avg = {k: v / args.log_every for k, v in running.items()}
-            running = {}
-            msg = " ".join(f"{k}={v:.3f}" for k, v in avg.items())
-            print(f"[step {step}/{args.steps}] {msg} lr={sched_g.get_last_lr()[0]:.2e}", flush=True)
-        if step % args.save_every == 0:
-            save_checkpoint(step)
+              step += 1
+              for k, v in {"mel": l_mel, "stft": l_stft, "adv": l_adv, "feat": l_feat, "disc": loss_d}.items():
+                  running[k] = running.get(k, 0.0) + float(v.detach())
+              if step % args.log_every == 0:
+                  avg = {k: v / args.log_every for k, v in running.items()}
+                  running = {}
+                  msg = " ".join(f"{k}={v:.3f}" for k, v in avg.items())
+                  print(f"[step {step}/{args.steps}] {msg} lr={sched_g.get_last_lr()[0]:.2e}", flush=True)
+              if step % args.save_every == 0:
+                  save_checkpoint(step)
+        except RuntimeError as exc:
+          # Windowsではワーカー死亡が共有メモリイベントのRuntimeErrorとして表面化する。
+          # 学習状態はプロセス内にあるためワーカーだけ作り直して続行する
+          print(f"[warn] DataLoader crashed at step {step}: {exc} -> restarting workers", flush=True)
+          del loader
 
     if step % args.save_every != 0:
         save_checkpoint(step)
