@@ -59,8 +59,8 @@ train:
   dataloader_prefetch_factor: 4
   allow_tf32: true
   compile_model: false
-  precision: bf16
-  # Weights/optimizer stay full-precision; precision=bf16 uses CUDA autocast only.
+  precision: fp32
+  # Full float32 training (no autocast). Set precision=bf16 for CUDA autocast mixed precision.
   # adamw8bit -> muon: orthogonalized updates on hidden matrices converge
   # faster per step; embeddings/norms/output heads stay on AdamW. On resume
   # from an adamw8bit checkpoint the stored optimizer state is incompatible;

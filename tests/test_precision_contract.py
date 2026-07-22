@@ -136,7 +136,7 @@ def test_tiny_model_forward_fp32_and_bf16() -> None:
 def test_train_config_mixed_precision_defaults() -> None:
     cfg = TrainConfig()
     assert cfg.precision in {"fp32", "bf16"}
-    assert cfg.precision == "bf16"
+    assert cfg.precision == "fp32"
     assert not hasattr(cfg, "pure_bf16")
     assert not hasattr(cfg, "bf16_stochastic_round")
 

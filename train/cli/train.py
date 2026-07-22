@@ -1466,8 +1466,8 @@ def main() -> None:
     parser.add_argument(
         "--precision",
         choices=["fp32", "bf16"],
-        default="bf16",
-        help="Compute precision for model forward pass. Weights/optimizer stay fp32 masters.",
+        default="fp32",
+        help="Compute precision for model forward pass. fp32 = full precision; bf16 = CUDA autocast.",
     )
     parser.add_argument(
         "--tf32",

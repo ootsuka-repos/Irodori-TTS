@@ -53,7 +53,7 @@ python -m inference.cli.convert_checkpoint <ckpt.pt> --use-ema
 - 学習configは `train/configs/train_500m_v3_full.yaml` の一本のみ（起動コマンドは `train_command_windows.txt`）。valid分割なし（`valid_ratio: 0`）、毎epochサンプル推論
 - マニフェスト差し替え時は `train.jsonl.irodori_index.pt`（loaderインデックス）が自動再構築される（キャッシュキーにバージョン番号 `_MANIFEST_INDEX_CACHE_VERSION` — indexへのフィールド追加時は必ずインクリメント）
 - **resume時**、yaml/CLIのoptimizerハイパラ（`learning_rate`/`weight_decay`/`muon_momentum`/`adam_beta*`/`adam_eps`/`muon_adjust_lr_fn`）はcheckpoint値を上書きして反映（moment・stepカウントは保持）。`weight_decay`はdecayグループのみに適用（param_groupの`irodori_decay`マーカーで判別。旧checkpointは`wd>0`フォールバック）
-- 学習精度は混合精度（FP32 マスター + `precision=bf16` 時の CUDA autocast）。pure-bf16 実験経路は削除済み
+- 学習精度は **FP32 固定**（`precision: fp32`）。`precision=bf16` にすると CUDA autocast 混合精度。pure-bf16 実験経路は削除済み
 
 ### category を使った学習時サンプリング（train/dataset.py + train/sampler.py）
 

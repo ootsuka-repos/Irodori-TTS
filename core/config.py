@@ -175,7 +175,7 @@ class TrainConfig:
     valid_split_by: str = "sample"
     progress: bool = True
     progress_all_ranks: bool = False
-    precision: str = "bf16"
+    precision: str = "fp32"
     grad_clip_norm: float = 1.0
     gradient_accumulation_steps: int = 1
     max_text_len: int = 256
