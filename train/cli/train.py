@@ -1465,9 +1465,9 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
         "--precision",
-        choices=["bf16"],
+        choices=["fp32", "bf16"],
         default="bf16",
-        help="Compute precision for model forward pass (bf16 only).",
+        help="Compute precision for model forward pass. Weights/optimizer stay fp32 masters.",
     )
     parser.add_argument(
         "--tf32",
@@ -2252,12 +2252,17 @@ def main() -> None:
             f"wandb_mode must be one of {sorted(WANDB_MODES)}, got {train_cfg.wandb_mode!r}"
         )
     precision = str(train_cfg.precision).lower()
-    if precision != "bf16":
-        raise ValueError(f"precision must be 'bf16', got {train_cfg.precision!r}")
-    if device.type != "cuda":
-        raise ValueError("precision=bf16 requires a CUDA device.")
-    if not torch.cuda.is_bf16_supported():
-        raise ValueError("CUDA bf16 is not supported on this GPU.")
+    if precision not in {"fp32", "bf16"}:
+        raise ValueError(f"precision must be one of ['fp32', 'bf16'], got {train_cfg.precision!r}")
+    if precision == "bf16":
+        if device.type != "cuda":
+            if is_main_process:
+                print("warning: precision=bf16 requested on non-CUDA device. Falling back to fp32.")
+            train_cfg = replace(train_cfg, precision="fp32")
+        elif not torch.cuda.is_bf16_supported():
+            if is_main_process:
+                print("warning: CUDA bf16 is not supported on this GPU. Falling back to fp32.")
+            train_cfg = replace(train_cfg, precision="fp32")
     use_bf16 = train_cfg.precision == "bf16"
     if device.type == "cuda":
         tf32_enabled = bool(train_cfg.allow_tf32)
@@ -2273,10 +2278,10 @@ def main() -> None:
     if is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
         dump_configs(output_dir / "config.json", model_cfg, train_cfg)
-        if train_cfg.pure_bf16 and use_bf16:
-            print("Compute precision=bf16 (pure: weights/grads/optimizer states in bf16).")
-        else:
-            print(f"Compute precision={train_cfg.precision} (weights/optimizer states kept in full-precision).")
+        print(
+            f"Compute precision={train_cfg.precision} "
+            "(weights/optimizer states kept in full-precision)."
+        )
     if distributed:
         dist.barrier()
     if is_main_process and distributed:
@@ -2763,14 +2768,6 @@ def main() -> None:
         raw_model.set_gradient_checkpointing(True)
         if is_main_process:
             print("Gradient checkpointing enabled on diffusion blocks.")
-    if train_cfg.pure_bf16:
-        if not use_bf16:
-            if is_main_process:
-                print("warning: pure_bf16=True requires precision=bf16; ignoring.")
-        else:
-            raw_model.to(torch.bfloat16)
-            if is_main_process:
-                print("pure_bf16: model cast to bf16 (optimizer states follow param dtype).")
     train_model = raw_model
     if train_cfg.compile_model:
         if not hasattr(torch, "compile"):
@@ -2837,26 +2834,6 @@ def main() -> None:
         print(
             f"Optimizer={train_cfg.optimizer} Scheduler={train_cfg.lr_scheduler} lr={current_lr(optimizer):.3e}"
         )
-        if (
-            train_cfg.pure_bf16
-            and train_cfg.bf16_stochastic_round
-            and train_cfg.optimizer.lower() in {"muon", "adamw"}
-        ):
-            print(
-                "bf16 stochastic rounding active: optimizer updates computed in full-precision, "
-                "params/moments stored bf16."
-            )
-        if (
-            train_cfg.pure_bf16
-            and train_cfg.bf16_stochastic_round
-            and train_cfg.optimizer.lower() == "adamw8bit"
-        ):
-            print(
-                "warning: optimizer=adamw8bit does not implement bf16 stochastic rounding. "
-                "Under pure_bf16 its bf16 parameter writes round to nearest, so sub-ulp "
-                "updates (most steps at lr<=1e-4) are silently lost. Use optimizer=adamw "
-                "or muon to get stochastic rounding."
-            )
         if train_config_uses_lora(train_cfg) and train_cfg.optimizer.lower() == "muon":
             print(
                 "warning: optimizer=muon Newton-Schulz-orthogonalizes every 2D weight, "
@@ -3261,11 +3238,6 @@ def main() -> None:
                         loss = duration_loss
                     else:
                         loss = rf_loss + (float(train_cfg.duration_loss_weight) * duration_loss)
-                    # pure_bf16 note: autograd accumulates into bf16 .grad buffers,
-                    # so micro-batch accumulation sums gradients in bf16 (nearest).
-                    # Stochastic rounding covers only the optimizer step, not this
-                    # sum; accum_steps are same-scale additions so the error stays
-                    # negligible.
                     (loss / float(accum_steps)).backward()
                     if caption_warmup_active:
                         clear_non_caption_grads(raw_model)
@@ -3289,11 +3261,6 @@ def main() -> None:
                 accum_duration_mae_frames.zero_()
                 accum_duration_group_totals.zero_()
 
-                # pure_bf16 note: the grad norm is reduced in bf16 here, outside the
-                # full-precision stochastic-rounding path. The resulting ~0.4% jitter is
-                # harmless — Muon rescales updates via Newton-Schulz regardless of
-                # gradient magnitude, so clipping effectively bites only the aux
-                # AdamW group.
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), train_cfg.grad_clip_norm
                 )

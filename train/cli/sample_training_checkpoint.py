@@ -114,9 +114,9 @@ def main() -> None:
         RuntimeKey(
             checkpoint=str(checkpoint),
             model_device="cuda",
-            model_precision="bf16",
+            model_precision="fp32",
             codec_device="cuda",
-            codec_precision="bf16",
+            codec_precision="fp32",
             use_ema=bool(args.use_ema),
         )
     )

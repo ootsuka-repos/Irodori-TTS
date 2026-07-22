@@ -1,95 +1,121 @@
+"""Training precision contract: FP32 masters + optional bf16 autocast (original path)."""
+
 from __future__ import annotations
 
 import torch
 
-from train.bf16_audio import (
-    BF16MelSpectrogramLoss,
-    BF16MultiScaleSTFTLoss,
-    bf16_stft_parts,
-    configure_discriminator_bf16_stft,
-)
-from train.cli.finetune_dacvae_decoder import normalize_batch
-from train.optim import AdamWBF16
+from core.config import ModelConfig, TrainConfig
+from core.model import TextToLatentRFDiT
+from core.rf import sample_logit_normal_t
 
 
-def test_bf16_dft_matches_stft_reference_and_backpropagates() -> None:
-    waveform = torch.randn(2, 1, 64, dtype=torch.bfloat16, requires_grad=True)
-    real, imag = bf16_stft_parts(waveform, n_fft=16, hop_length=4)
-
-    assert real.shape == imag.shape == (2, 1, 9, 17)
-    assert real.dtype == imag.dtype == torch.bfloat16
-
-    window = torch.hann_window(16, periodic=True)
-    reference = torch.stft(
-        waveform.float().reshape(-1, 64),
-        16,
-        4,
-        window=window,
-        return_complex=True,
+def _tiny_cfg() -> ModelConfig:
+    return ModelConfig(
+        latent_dim=8,
+        model_dim=16,
+        num_layers=1,
+        num_heads=2,
+        mlp_ratio=2.0,
+        text_mlp_ratio=2.0,
+        text_vocab_size=32,
+        text_dim=16,
+        text_layers=1,
+        text_heads=2,
+        use_speaker_condition=False,
+        timestep_embed_dim=8,
+        adaln_rank=4,
     )
-    actual = torch.complex(real.float(), imag.float()).reshape_as(reference)
-    assert torch.allclose(actual, reference, atol=0.08, rtol=0.08)
 
-    target = waveform.detach() * torch.tensor(0.9, dtype=torch.bfloat16)
-    loss = BF16MultiScaleSTFTLoss(window_lengths=(16, 8))(waveform, target)
-    assert loss.dtype == torch.bfloat16
+
+def test_train_config_mixed_precision_defaults() -> None:
+    cfg = TrainConfig()
+    assert cfg.precision in {"fp32", "bf16"}
+    assert not hasattr(cfg, "pure_bf16")
+    assert not hasattr(cfg, "bf16_stochastic_round")
+
+
+def test_rf_timestep_sampling_is_float32() -> None:
+    t = sample_logit_normal_t(4, device=torch.device("cpu"))
+    assert t.dtype == torch.float32
+    assert t.shape == (4,)
+
+
+def test_train_step_fp32_masters_with_optional_bf16_autocast() -> None:
+    """One micro-batch forward+backward+optimizer step on the shipped model."""
+    model = TextToLatentRFDiT(_tiny_cfg()).to(dtype=torch.float32)
+    assert all(p.dtype == torch.float32 for p in model.parameters())
+
+    optim = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    text_ids = torch.randint(0, 32, (2, 5))
+    text_mask = torch.ones(2, 5, dtype=torch.bool)
+    x0 = torch.randn(2, 6, 8)
+    noise = torch.randn_like(x0)
+    t = sample_logit_normal_t(2, device=torch.device("cpu"))
+    x_t = (1.0 - t[:, None, None]) * x0 + t[:, None, None] * noise
+    target = noise - x0
+
+    use_cuda_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    device = torch.device("cuda" if use_cuda_bf16 else "cpu")
+    model = model.to(device)
+    text_ids = text_ids.to(device)
+    text_mask = text_mask.to(device)
+    x_t = x_t.to(device)
+    t = t.to(device)
+    target = target.to(device)
+
+    model.train()
+    optim.zero_grad(set_to_none=True)
+
+    if use_cuda_bf16:
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            pred = model(
+                x_t=x_t,
+                t=t,
+                text_input_ids=text_ids,
+                text_mask=text_mask,
+                ref_latent=None,
+                ref_mask=None,
+            )
+            loss = torch.nn.functional.mse_loss(pred.float(), target.float())
+    else:
+        pred = model(
+            x_t=x_t,
+            t=t,
+            text_input_ids=text_ids,
+            text_mask=text_mask,
+            ref_latent=None,
+            ref_mask=None,
+        )
+        loss = torch.nn.functional.mse_loss(pred, target)
+
     loss.backward()
-    assert waveform.grad is not None
-    assert waveform.grad.dtype == torch.bfloat16
+    optim.step()
+
+    assert torch.isfinite(loss.detach().float()).item()
+    assert all(p.dtype == torch.float32 for p in model.parameters())
 
 
-def test_bf16_mel_and_mrd_paths_stay_bf16() -> None:
-    waveform = torch.randn(2, 1, 64, dtype=torch.bfloat16, requires_grad=True)
-    target = waveform.detach() * torch.tensor(0.8, dtype=torch.bfloat16)
-    mel_loss = BF16MelSpectrogramLoss(
-        sample_rate=16_000,
-        n_mels=(4,),
-        window_lengths=(16,),
-        mel_fmin=(0.0,),
-        mel_fmax=(8_000.0,),
-    )(waveform, target)
-    assert mel_loss.dtype == torch.bfloat16
-    mel_loss.backward()
-    assert waveform.grad is not None
-    assert waveform.grad.dtype == torch.bfloat16
+def test_train_step_explicit_fp32_precision() -> None:
+    model = TextToLatentRFDiT(_tiny_cfg()).to(dtype=torch.float32)
+    optim = torch.optim.SGD(model.parameters(), lr=1e-2)
+    text_ids = torch.randint(0, 32, (1, 4))
+    text_mask = torch.ones(1, 4, dtype=torch.bool)
+    x_t = torch.randn(1, 5, 8)
+    t = torch.tensor([0.4])
+    target = torch.randn(1, 5, 8)
 
-    class FakeMRD(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.window_length = 16
-            self.hop_factor = 0.25
-            self.bands = [(0, 4), (4, 9)]
-
-    class FakeDiscriminator(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.discriminators = torch.nn.ModuleList([FakeMRD()])
-
-    discriminator = FakeDiscriminator()
-    assert configure_discriminator_bf16_stft(discriminator) == 1
-    bands = discriminator.discriminators[0].spectrogram(target)
-    assert [band.shape for band in bands] == [(2, 2, 16, 4), (2, 2, 16, 5)]
-    assert all(band.dtype == torch.bfloat16 for band in bands)
-
-
-def test_adamw_bf16_keeps_all_tensor_state_in_bf16() -> None:
-    parameter = torch.nn.Parameter(torch.randn(8, 8, dtype=torch.bfloat16))
-    optimizer = AdamWBF16([parameter], lr=1e-3, betas=(0.8, 0.99))
-
-    parameter.square().mean().backward()
-    optimizer.step()
-
-    state = optimizer.state[parameter]
-    assert parameter.grad is not None
-    assert parameter.dtype == parameter.grad.dtype == torch.bfloat16
-    assert state["exp_avg"].dtype == torch.bfloat16
-    assert state["exp_avg_sq"].dtype == torch.bfloat16
-    assert isinstance(state["step"], int)
-
-
-def test_dacvae_input_normalization_remains_bf16() -> None:
-    waveform = torch.randn(2, 256, dtype=torch.bfloat16) * 0.01
-    normalized = normalize_batch(waveform, target_db=-16.0)
-
-    assert normalized.shape == (2, 1, 256)
-    assert normalized.dtype == torch.bfloat16
+    model.train()
+    optim.zero_grad(set_to_none=True)
+    pred = model(
+        x_t=x_t,
+        t=t,
+        text_input_ids=text_ids,
+        text_mask=text_mask,
+        ref_latent=None,
+        ref_mask=None,
+    )
+    loss = torch.nn.functional.mse_loss(pred, target)
+    loss.backward()
+    optim.step()
+    assert torch.isfinite(loss.detach()).item()
+    assert all(p.dtype == torch.float32 for p in model.parameters())

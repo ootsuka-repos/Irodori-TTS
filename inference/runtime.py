@@ -92,8 +92,10 @@ def default_runtime_device() -> str:
 
 
 def list_available_runtime_precisions(device: str | torch.device) -> list[str]:
-    resolve_runtime_device(device)
-    return ["bf16"]
+    resolved = resolve_runtime_device(device)
+    if resolved.type in ("cuda", "xpu"):
+        return ["fp32", "bf16"]
+    return ["fp32"]
 
 
 def _sync_device(device: torch.device) -> None:
@@ -148,9 +150,9 @@ class RuntimeKey:
     checkpoint: str
     model_device: str
     codec_repo: str = "Aratako/Semantic-DACVAE-Japanese-32dim"
-    model_precision: str = "bf16"
+    model_precision: str = "fp32"
     codec_device: str = "cpu"
-    codec_precision: str = "bf16"
+    codec_precision: str = "fp32"
     codec_deterministic_encode: bool = True
     codec_deterministic_decode: bool = True
     compile_model: bool = False
@@ -244,8 +246,6 @@ def _move_inference_module(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.nn.Module:
-    if dtype is not torch.bfloat16:
-        raise ValueError(f"inference modules require bf16, got {dtype}")
     module.to(device=device)
     with torch.no_grad():
         for param in module.parameters():
@@ -261,35 +261,18 @@ def _move_inference_module(
                     child._buffers[name] = buffer.to(device=device, dtype=dtype)
                 elif buffer.device != device:
                     child._buffers[name] = buffer.to(device=device)
-    _assert_module_bf16(module, label=module.__class__.__name__)
     return module
-
-
-def _assert_module_bf16(module: torch.nn.Module, *, label: str) -> None:
-    invalid: list[str] = []
-    for name, tensor in module.named_parameters():
-        if tensor.is_complex() or (tensor.is_floating_point() and tensor.dtype is not torch.bfloat16):
-            invalid.append(f"parameter:{name}={tensor.dtype}")
-    for name, tensor in module.named_buffers():
-        if tensor.is_complex() or (tensor.is_floating_point() and tensor.dtype is not torch.bfloat16):
-            invalid.append(f"buffer:{name}={tensor.dtype}")
-    if invalid:
-        details = ", ".join(invalid[:8])
-        if len(invalid) > 8:
-            details += f", ... ({len(invalid)} total)"
-        raise RuntimeError(f"{label} contains non-BF16 floating tensors: {details}")
-
-
-def _require_bf16_tensor(tensor: torch.Tensor, *, label: str) -> None:
-    if tensor.dtype is not torch.bfloat16:
-        raise RuntimeError(f"{label} must be bf16, got {tensor.dtype}")
 
 
 def resolve_runtime_dtype(*, precision: str, device: torch.device) -> torch.dtype:
     mode = str(precision).strip().lower()
+    if mode == "fp32":
+        return torch.float32
     if mode == "bf16":
+        if device.type not in ("cuda", "xpu"):
+            raise ValueError("precision='bf16' currently requires CUDA or XPU device.")
         return torch.bfloat16
-    raise ValueError(f"Unsupported precision={precision!r}. Expected 'bf16'.")
+    raise ValueError(f"Unsupported precision={precision!r}. Expected one of: fp32, bf16.")
 
 
 def resolve_cfg_scales(
@@ -463,17 +446,6 @@ def _load_checkpoint_for_inference(
     return _load_checkpoint_from_pt(path, use_ema=use_ema)
 
 
-def _cast_checkpoint_state_bf16(
-    state_dict: dict[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
-    for key, tensor in state_dict.items():
-        if tensor.is_complex():
-            raise ValueError(f"Inference checkpoint tensor '{key}' must not be complex.")
-        if tensor.is_floating_point() and tensor.dtype is not torch.bfloat16:
-            state_dict[key] = tensor.to(dtype=torch.bfloat16)
-    return state_dict
-
-
 class InferenceRuntime:
     def __init__(
         self,
@@ -501,7 +473,6 @@ class InferenceRuntime:
         self.default_caption_max_len = default_caption_max_len
         self.watermarker = SilentCipherWatermarker(
             device=str(self.codec_device),
-            dtype=self.codec.dtype,
         )
         self._infer_lock = threading.Lock()
         self._model_dtype = next(self.model.parameters()).dtype
@@ -524,10 +495,9 @@ class InferenceRuntime:
             Path(key.checkpoint),
             use_ema=bool(key.use_ema),
         )
-        model_state = _cast_checkpoint_state_bf16(model_state)
         model_cfg = ModelConfig(**model_cfg_dict)
 
-        model = TextToLatentRFDiT(model_cfg).to(device=model_device, dtype=model_dtype)
+        model = TextToLatentRFDiT(model_cfg).to(model_device)
         model.load_state_dict(model_state)
         del model_state
         model = _move_inference_module(model, device=model_device, dtype=model_dtype)
@@ -580,7 +550,6 @@ class InferenceRuntime:
             deterministic_encode=bool(key.codec_deterministic_encode),
             deterministic_decode=bool(key.codec_deterministic_decode),
         )
-        _assert_module_bf16(codec.model, label="DACVAE codec")
         if model_cfg.latent_dim != codec.latent_dim:
             raise ValueError(
                 f"Latent dimension mismatch: checkpoint latent_dim={model_cfg.latent_dim} but codec latent_dim={codec.latent_dim}. "
@@ -1097,7 +1066,6 @@ class InferenceRuntime:
                     if self.model_cfg.use_caption_condition
                     else None,
                 )
-                _require_bf16_tensor(pred_log_frames, label="duration prediction")
                 pred_frames = torch.expm1(pred_log_frames).mean().item()
                 scaled_frames = pred_frames * duration_scale
                 min_frames = max(1, math.ceil(min_seconds * self.codec.sample_rate / hop_length))
@@ -1165,7 +1133,6 @@ class InferenceRuntime:
                 t_schedule_mode=str(req.t_schedule_mode),
                 sway_coeff=float(req.sway_coeff),
             )
-            _require_bf16_tensor(z_patched, label="RF sampled latent")
             stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("sample_rf", stage_sec))
             _log(f"[runtime] sample_rf: {stage_sec * 1000.0:.1f} ms")
@@ -1176,7 +1143,6 @@ class InferenceRuntime:
                 patch_size=self.model_cfg.latent_patch_size,
                 latent_dim=self.model_cfg.latent_dim,
             )
-            _require_bf16_tensor(z, label="unpatchified latent")
             stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("unpatchify_latent", stage_sec))
             _log(f"[runtime] unpatchify_latent: {stage_sec * 1000.0:.1f} ms")
@@ -1235,9 +1201,6 @@ class InferenceRuntime:
                 )
                 messages.append(msg)
                 _log(msg)
-
-            for audio_i in trimmed_audios:
-                _require_bf16_tensor(audio_i, label="generated waveform")
 
             total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
             _log(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
@@ -1306,40 +1269,28 @@ def clear_cached_runtime() -> None:
 
 def _load_audio(path: str | Path) -> tuple[torch.Tensor, int]:
     try:
+        return torchaudio.load(str(path))
+    except RuntimeError:
         import soundfile as sf
 
-        data, sample_rate = sf.read(str(path), dtype="int16", always_2d=True)
-        wav = torch.from_numpy(data.T.copy()).to(dtype=torch.bfloat16).div_(32768.0)
-        return wav, sample_rate
-    except (ImportError, OSError, RuntimeError):
-        # TorchCodec/torchaudio is retained for containers unsupported by libsndfile;
-        # cast its decoder boundary immediately before any inference operation.
-        wav, sample_rate = torchaudio.load(str(path))
-        return wav.to(dtype=torch.bfloat16), sample_rate
+        data, sr = sf.read(str(path), dtype="float32")
+        wav = torch.from_numpy(data)
+        if wav.ndim == 1:
+            wav = wav.unsqueeze(0)
+        else:
+            wav = wav.T
+        return wav, sr
 
 
 def save_wav(path: str | Path, audio: torch.Tensor, sample_rate: int) -> Path:
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if audio.dtype is not torch.bfloat16:
-        raise RuntimeError(f"save_wav requires bf16 audio, got {audio.dtype}")
-    audio_cpu = audio.detach().to(device="cpu").clamp(-1.0, 1.0)
-    audio_pcm16 = (audio_cpu * 32704.0).round().to(dtype=torch.int16)
+    audio_cpu = audio.detach().to(device="cpu", dtype=torch.float32)
     try:
-        torchaudio.save(
-            str(out_path),
-            audio_pcm16,
-            sample_rate,
-            encoding="PCM_S",
-            bits_per_sample=16,
-        )
-    except (ImportError, RuntimeError):
+        torchaudio.save(str(out_path), audio_cpu, sample_rate)
+    except RuntimeError:
         import soundfile as sf
 
-        audio_np = (
-            audio_pcm16.squeeze(0).numpy()
-            if audio_pcm16.shape[0] == 1
-            else audio_pcm16.T.numpy()
-        )
-        sf.write(str(out_path), audio_np, sample_rate, subtype="PCM_16")
+        audio_np = audio_cpu.squeeze(0).numpy() if audio_cpu.shape[0] == 1 else audio_cpu.T.numpy()
+        sf.write(str(out_path), audio_np, sample_rate)
     return out_path

@@ -29,7 +29,7 @@ def normalize_speaker_embedding_tensor(
             f"{field_name} dim mismatch: expected {int(speaker_dim)}, got {int(tensor.shape[1])}"
         )
 
-    return tensor.detach().to(dtype=torch.bfloat16).contiguous()
+    return tensor.detach().to(dtype=torch.float32).contiguous()
 
 
 def is_speaker_inversion_safetensors_path(path: str | Path) -> bool:
@@ -59,7 +59,7 @@ class SpeakerInversionEmbedding(nn.Module):
             raise ValueError(f"speaker inversion init_std must be >= 0, got {init_std}")
 
         if init_embedding is None:
-            embedding = torch.randn(num_tokens, speaker_dim, dtype=torch.bfloat16) * init_std
+            embedding = torch.randn(num_tokens, speaker_dim, dtype=torch.float32) * init_std
         else:
             embedding = normalize_speaker_embedding_tensor(
                 init_embedding,
@@ -122,7 +122,7 @@ def normalize_speaker_inversion_payload(
     embedding = payload[SPEAKER_EMBEDDING_KEY]
 
     out: dict[str, torch.Tensor] = {
-        SPEAKER_EMBEDDING_KEY: embedding.to(dtype=torch.bfloat16),
+        SPEAKER_EMBEDDING_KEY: embedding.to(dtype=torch.float32),
     }
 
     return out
@@ -147,7 +147,7 @@ def save_speaker_inversion_safetensors(
     path: str | Path,
     payload: dict[str, torch.Tensor],
     *,
-    dtype: torch.dtype = torch.bfloat16,
+    dtype: torch.dtype = torch.float32,
 ) -> None:
     target = Path(path)
     if not is_speaker_inversion_safetensors_path(target):
@@ -181,7 +181,7 @@ def speaker_inversion_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
         raise ValueError("Model does not have an enabled SpeakerInversionEmbedding module.")
 
     return {
-        SPEAKER_EMBEDDING_KEY: module.embedding.detach().cpu().to(dtype=torch.bfloat16).clone(),
+        SPEAKER_EMBEDDING_KEY: module.embedding.detach().cpu().to(dtype=torch.float32).clone(),
     }
 
 

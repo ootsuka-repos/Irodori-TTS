@@ -2,9 +2,9 @@
 # データセット全再作成（prepare_all — 6ステージ再開可能・キャッシュ済みは自動スキップ）
 #   対象: dataset\collected\<データセット名>\source の音源
 #   出力: 同ディレクトリ配下の pipeline（work dir・クリップFLAC・VADキャッシュ）
-#         manifests\train.jsonl（publishで原子的置換） / latents\clips_<key>（bf16）
-#   latentはbf16でエンコードされる（core/codec.py のデフォルトdtype +
-#   prepare_all.py LATENT_ENCODE_PARAMS の encode_dtype キー）
+#         manifests\train.jsonl（publishで原子的置換） / latents\clips_<key>
+#   latent は codec 既定（通常 float32）でエンコードされる
+#   （prepare_all.py LATENT_ENCODE_PARAMS の encode_dtype が fingerprint に入る）
 #
 #   途中で止めても再実行すればキャッシュから続行（VAD/クリップ/ASR/校正すべて）。
 #   ステージ: speech → nonverbal → transcribe → context_correction → latents → publish

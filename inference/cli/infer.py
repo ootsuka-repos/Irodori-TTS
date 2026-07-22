@@ -100,8 +100,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--model-precision",
-        choices=["bf16"],
-        default="bf16",
+        choices=["fp32", "bf16"],
+        default="fp32",
         help="Model precision for weights/compute.",
     )
     parser.add_argument(
@@ -111,8 +111,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--codec-precision",
-        choices=["bf16"],
-        default="bf16",
+        choices=["fp32", "bf16"],
+        default="fp32",
         help="Codec precision for weights/compute.",
     )
     parser.add_argument(

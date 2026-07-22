@@ -47,9 +47,10 @@ LATENT_ENCODE_PARAMS: dict[str, Any] = {
     "deterministic_encode": True,
     "deterministic_decode": True,
     "text_normalize": False,
-    # DACVAECodec.load のデフォルトdtype（core/codec.py）。単精度→bf16化に伴い
-    # キーへ追加 — 旧単精度 latentディレクトリを自動無効化して全再エンコードさせる。
-    "encode_dtype": "bfloat16",
+    # Codec encode dtype fingerprint (core/codec.py load dtype=None → model native,
+    # typically float32). Changing this invalidates latent caches so old pure-bf16
+    # latents are not silently reused after the mixed-precision restore.
+    "encode_dtype": "float32",
 }
 PUBLISH_BACKUP_KEEP = 5
 
