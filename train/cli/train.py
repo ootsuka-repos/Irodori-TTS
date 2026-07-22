@@ -2263,7 +2263,7 @@ def main() -> None:
         tf32_enabled = bool(train_cfg.allow_tf32)
         torch.backends.cuda.matmul.allow_tf32 = tf32_enabled
         torch.backends.cudnn.allow_tf32 = tf32_enabled
-        getattr(torch, "set_float" "32_matmul_precision")("high" if tf32_enabled else "highest")
+        torch.set_float32_matmul_precision("high" if tf32_enabled else "highest")
         if is_main_process:
             print(f"TF32 matmul/cuDNN: {'enabled' if tf32_enabled else 'disabled'}")
     elif train_cfg.allow_tf32 and is_main_process:

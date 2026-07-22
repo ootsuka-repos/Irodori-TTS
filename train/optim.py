@@ -254,6 +254,96 @@ class MuonBF16SR(torch.optim.Optimizer):
         return loss
 
 
+class AdamWBF16(torch.optim.Optimizer):
+    """AdamW whose parameters, gradients, moments, and tensor temporaries are bf16."""
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 1e-2,
+    ) -> None:
+        if lr < 0.0:
+            raise ValueError(f"lr must be non-negative, got {lr}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"beta1 must be in [0, 1), got {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"beta2 must be in [0, 1), got {betas[1]}")
+        if eps < 0.0:
+            raise ValueError(f"eps must be non-negative, got {eps}")
+        if weight_decay < 0.0:
+            raise ValueError(f"weight_decay must be non-negative, got {weight_decay}")
+        super().__init__(
+            params,
+            {
+                "lr": lr,
+                "betas": betas,
+                "eps": eps,
+                "weight_decay": weight_decay,
+            },
+        )
+        for group in self.param_groups:
+            for param in group["params"]:
+                if param.dtype is not torch.bfloat16:
+                    raise ValueError(
+                        "AdamWBF16 accepts only bf16 parameters, "
+                        f"got {param.dtype} for shape={tuple(param.shape)}"
+                    )
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = float(group["lr"])
+            beta1, beta2 = group["betas"]
+            eps = float(group["eps"])
+            weight_decay = float(group["weight_decay"])
+            for param in group["params"]:
+                grad = param.grad
+                if grad is None:
+                    continue
+                if grad.is_sparse:
+                    raise RuntimeError("AdamWBF16 does not support sparse gradients")
+                if grad.dtype is not torch.bfloat16:
+                    raise RuntimeError(
+                        "AdamWBF16 requires bf16 gradients, "
+                        f"got {grad.dtype} for shape={tuple(grad.shape)}"
+                    )
+
+                state = self.state[param]
+                if not state:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(
+                        param, memory_format=torch.preserve_format
+                    )
+                    state["exp_avg_sq"] = torch.zeros_like(
+                        param, memory_format=torch.preserve_format
+                    )
+
+                state["step"] += 1
+                step = int(state["step"])
+                exp_avg = state["exp_avg"]
+                exp_avg_sq = state["exp_avg_sq"]
+
+                exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+                bias_correction1 = 1.0 - beta1**step
+                bias_correction2_sqrt = math.sqrt(1.0 - beta2**step)
+                denom = exp_avg_sq.sqrt().div_(bias_correction2_sqrt).add_(eps)
+
+                param.mul_(1.0 - lr * weight_decay)
+                param.addcdiv_(exp_avg, denom, value=-(lr / bias_correction1))
+
+        return loss
+
+
 class AdamWBF16SR(torch.optim.AdamW):
     """
     AdamW (decoupled weight decay) computing the step in full-precision and storing

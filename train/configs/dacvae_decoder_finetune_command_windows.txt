@@ -3,6 +3,7 @@
 #   出力: outputs\dacvae_decoder_ft
 #   エンコーダ・in_proj（latent空間）は完全凍結 — TTS本体・既存latentと互換のまま
 #   学習対象: quantizer.out_proj + decoder.model + wm encoder_block.pre（70.7M params）
+#   精度: CUDA bf16固定（重み・勾配・AdamW状態・損失・実数DFTをすべてbf16化）
 #   損失: multi-scale mel + MS-STFT + MPD/MRD adversarial + feature matching（DACレシピ準拠）
 #   データ: dataset\collected\オナニー1\source 全件からランダム切り出し（オンザフライencode→decode）
 #

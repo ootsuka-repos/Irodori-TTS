@@ -27,30 +27,53 @@ DURATION_ARCHITECTURES = {
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
-    t = torch.arange(end, dtype=torch.float)
-    freqs = torch.outer(t, freqs)
-    return torch.complex(torch.cos(freqs), torch.sin(freqs))
+    """Build real-valued BF16 RoPE constants as ``(..., cos/sin)`` pairs."""
+    if dim % 2 != 0:
+        raise ValueError(f"RoPE dim must be even, got {dim}")
+    # Calculate constants as Python scalars so long sequence positions are not
+    # quantized before sin/cos, then materialize only the final BF16 tensor.
+    inv_freqs = [1.0 / (theta ** (index / dim)) for index in range(0, dim, 2)]
+    values = [
+        [(math.cos(position * freq), math.sin(position * freq)) for freq in inv_freqs]
+        for position in range(end)
+    ]
+    return torch.tensor(values, dtype=torch.bfloat16)
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     # x: (B, S, H, Dh), Dh must be even.
-    x_ = torch.view_as_complex(x.float().reshape(*x.shape[:3], -1, 2))
-    x_ = x_ * freqs_cis[None, :, None, :]
-    x_ = torch.view_as_real(x_).reshape_as(x)
-    return x_.type_as(x)
-
-
-def get_timestep_embedding(timestep: torch.Tensor, dim: int) -> torch.Tensor:
-    assert dim % 2 == 0
-    half = dim // 2
-    freqs = 1000.0 * torch.exp(
-        -torch.log(torch.tensor(10000.0, device=timestep.device, dtype=torch.float))
-        * torch.arange(half, device=timestep.device, dtype=torch.float)
-        / half
+    x_pairs = x.reshape(*x.shape[:3], -1, 2)
+    real = x_pairs[..., 0]
+    imaginary = x_pairs[..., 1]
+    cos = freqs_cis[None, :, None, :, 0].to(device=x.device, dtype=x.dtype)
+    sin = freqs_cis[None, :, None, :, 1].to(device=x.device, dtype=x.dtype)
+    rotated = torch.stack(
+        (real * cos - imaginary * sin, real * sin + imaginary * cos),
+        dim=-1,
     )
-    args = timestep[:, None].float() * freqs[None, :]
-    return torch.cat([torch.cos(args), torch.sin(args)], dim=-1).to(timestep.dtype)
+    return rotated.reshape_as(x)
+
+
+def precompute_timestep_freqs(dim: int) -> torch.Tensor:
+    if dim % 2 != 0:
+        raise ValueError(f"timestep embedding dim must be even, got {dim}")
+    half = dim // 2
+    values = [
+        1000.0 * math.exp(-math.log(10000.0) * index / half) for index in range(half)
+    ]
+    return torch.tensor(values, dtype=torch.bfloat16)
+
+
+def get_timestep_embedding(
+    timestep: torch.Tensor,
+    dim: int,
+    freqs: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if freqs is None:
+        freqs = precompute_timestep_freqs(dim).to(timestep.device)
+    freqs = freqs.to(device=timestep.device, dtype=timestep.dtype)
+    args = timestep[:, None] * freqs[None, :]
+    return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
 
 class RMSNorm(nn.Module):
@@ -62,10 +85,8 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_dtype = x.dtype
-        x = x.float()
         x = x * torch.rsqrt((x * x).mean(dim=-1, keepdim=True) + self.eps)
-        return (x * self.weight).to(x_dtype)
+        return x * self.weight
 
 
 class LowRankAdaLN(nn.Module):
@@ -102,12 +123,10 @@ class LowRankAdaLN(nn.Module):
         scale = self.scale_up(self.scale_down(F.silu(scale))) + scale
         gate = self.gate_up(self.gate_down(F.silu(gate))) + gate
 
-        x_dtype = x.dtype
-        x = x.float()
         x = x * torch.rsqrt((x * x).mean(dim=-1, keepdim=True) + self.eps)
         x = x * (1.0 + scale) + shift
         gate = torch.tanh(gate)
-        return x.to(x_dtype), gate
+        return x, gate
 
 
 def patch_sequence_with_mask(
@@ -649,7 +668,7 @@ class TextEncoder(nn.Module):
         )
         self.head_dim = dim // heads
         self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
+            "_freqs_cis_cache", torch.empty(0, 0, 2, dtype=torch.bfloat16), persistent=False
         )
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
@@ -692,7 +711,7 @@ class ReferenceLatentEncoder(nn.Module):
         )
         self.head_dim = cfg.speaker_dim // cfg.speaker_heads
         self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
+            "_freqs_cis_cache", torch.empty(0, 0, 2, dtype=torch.bfloat16), persistent=False
         )
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
@@ -1164,7 +1183,7 @@ class DurationPredictor(nn.Module):
             for block in self.token_blocks:
                 h = block(h, cond=speaker_vec, caption_cond=caption_vec)
             token_logits = self.token_out_proj(self.token_out_norm(h)).squeeze(-1)
-            token_frames = F.softplus(token_logits.float())
+            token_frames = F.softplus(token_logits)
             total_frames = (token_frames * text_mask.to(dtype=token_frames.dtype)).sum(dim=1)
             return torch.log1p(total_frames.clamp_min(0.0))
 
@@ -1328,7 +1347,12 @@ class TextToLatentRFDiT(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("model head_dim must be even for RoPE")
         self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
+            "_freqs_cis_cache", torch.empty(0, 0, 2, dtype=torch.bfloat16), persistent=False
+        )
+        self.register_buffer(
+            "_timestep_freqs",
+            precompute_timestep_freqs(cfg.timestep_embed_dim),
+            persistent=False,
         )
 
     def set_gradient_checkpointing(self, enabled: bool) -> None:
@@ -1583,7 +1607,11 @@ class TextToLatentRFDiT(nn.Module):
         latent_mask: torch.Tensor | None = None,
         context_kv_cache: list[tuple[torch.Tensor, ...]] | None = None,
     ) -> torch.Tensor:
-        t_embed = get_timestep_embedding(t, self.cfg.timestep_embed_dim).to(dtype=x_t.dtype)
+        t_embed = get_timestep_embedding(
+            t,
+            self.cfg.timestep_embed_dim,
+            freqs=self._timestep_freqs,
+        )
         cond_embed = self.cond_module(t_embed)
         cond_embed = cond_embed[:, None, :]
 
@@ -1819,7 +1847,7 @@ class TextToLatentRFDiT(nn.Module):
             caption_mask=caption_mask,
             has_caption=has_caption,
         )
-        return pred.float()
+        return pred
 
     @property
     def device(self) -> torch.device:

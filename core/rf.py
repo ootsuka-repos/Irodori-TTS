@@ -25,7 +25,12 @@ def sample_logit_normal_t(
     t_max: float = 0.999,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    z = torch.randn(batch_size, device=device, generator=generator) * std + mean
+    z = torch.randn(
+        batch_size,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    ) * std + mean
     t = torch.sigmoid(z)
     return t.clamp(min=t_min, max=t_max)
 
@@ -45,10 +50,15 @@ def sample_stratified_logit_normal_t(
     u ~ stratified U(0, 1), z = mean + std * Phi^{-1}(u), t = sigmoid(z)
     """
     if batch_size <= 0:
-        return torch.empty((0,), device=device)
+        return torch.empty((0,), device=device, dtype=torch.bfloat16)
     u = (
-        torch.arange(batch_size, device=device, dtype=torch.float)
-        + torch.rand(batch_size, device=device, generator=generator)
+        torch.arange(batch_size, device=device, dtype=torch.bfloat16)
+        + torch.rand(
+            batch_size,
+            device=device,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
     ) / float(batch_size)
     u = u.clamp(1e-6, 1.0 - 1e-6)
     # Phi^{-1}(u) = sqrt(2) * erfinv(2u - 1)
@@ -156,6 +166,10 @@ def sample_euler_rf_cfg(
     dtype = model.dtype
     batch_size = text_input_ids.shape[0]
     latent_dim = model.cfg.patched_latent_dim
+    if dtype is not torch.bfloat16:
+        raise RuntimeError(f"RF inference requires bf16 model weights, got {dtype}")
+    if num_steps <= 0:
+        raise ValueError(f"num_steps must be > 0, got {num_steps}")
 
     rng, rng_device = _make_rng(seed=seed, device=device)
     x_t = torch.randn(
@@ -193,30 +207,36 @@ def sample_euler_rf_cfg(
     sway_coeff_value = float(sway_coeff)
     if not math.isfinite(sway_coeff_value):
         raise ValueError(f"sway_coeff must be finite, got {sway_coeff!r}.")
+    u_values = [index / num_steps for index in range(num_steps + 1)]
     if t_schedule_mode_norm == "linear":
-        u = torch.linspace(0.0, 1.0, num_steps + 1)
+        pass
     elif t_schedule_mode_norm == "sway":
         # F5-TTS-style Sway Sampling. Negative sway_coeff densifies the noise
         # side of the schedule (early steps); positive densifies the data side.
-        u = torch.linspace(0.0, 1.0, num_steps + 1)
-        u = u + sway_coeff_value * (torch.cos(0.5 * math.pi * u) + u - 1.0)
-        u = u.clamp(0.0, 1.0)
+        u_values = [
+            min(
+                1.0,
+                max(
+                    0.0,
+                    u + sway_coeff_value * (math.cos(0.5 * math.pi * u) + u - 1.0),
+                ),
+            )
+            for u in u_values
+        ]
     else:
         raise ValueError(
             f"Unsupported t_schedule_mode={t_schedule_mode!r}. Expected 'linear' or 'sway'."
         )
-    # Keep schedule decisions on CPU. Reading a device scalar with .item() in
-    # every solver step otherwise serializes the host with the accelerator.
-    t_schedule_cpu = (1.0 - u) * init_scale
-    if not bool(torch.all(t_schedule_cpu[:-1] > t_schedule_cpu[1:])):
+    # Keep solver decisions as Python scalars and create only the BF16 device
+    # tensor consumed by the model.
+    t_values = [(1.0 - u) * init_scale for u in u_values]
+    if not all(left > right for left, right in zip(t_values, t_values[1:], strict=False)):
         raise ValueError("t_schedule must be strictly decreasing; adjust num_steps or sway_coeff.")
-    t_values = t_schedule_cpu.tolist()
-    dt_values = (t_schedule_cpu[1:] - t_schedule_cpu[:-1]).tolist()
-    t_batches = (
-        t_schedule_cpu[:-1]
-        .to(device=device, dtype=dtype)
-        .unsqueeze(1)
-        .expand(-1, batch_size)
+    dt_values = [
+        right - left for left, right in zip(t_values, t_values[1:], strict=False)
+    ]
+    t_batches = torch.tensor(t_values[:-1], device=device, dtype=dtype).unsqueeze(1).expand(
+        -1, batch_size
     )
     use_independent_cfg = cfg_guidance_mode == "independent"
     use_joint_cfg = cfg_guidance_mode == "joint"

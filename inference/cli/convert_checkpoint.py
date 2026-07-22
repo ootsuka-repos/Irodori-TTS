@@ -74,6 +74,19 @@ def _extract_model_state(payload: dict[str, Any]) -> dict[str, torch.Tensor]:
     return model_state
 
 
+def _cast_inference_state_bf16(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    converted: dict[str, torch.Tensor] = {}
+    for key, tensor in state_dict.items():
+        if tensor.is_complex():
+            raise ValueError(f"Inference checkpoint tensor '{key}' must not be complex.")
+        if tensor.is_floating_point():
+            tensor = tensor.to(dtype=torch.bfloat16)
+        converted[key] = tensor.detach().cpu().contiguous()
+    return converted
+
+
 def _extract_model_config(payload: dict[str, Any]) -> dict[str, Any]:
     model_cfg = payload.get("model_config")
     if not isinstance(model_cfg, dict):
@@ -206,13 +219,13 @@ def _initialize_embedding_from_pretrained(
     text_backbone = AutoModel.from_pretrained(
         repo_id,
         trust_remote_code=False,
-        dtype=torch.float,
+        dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
     )
     pretrained_embedding = text_backbone.get_input_embeddings()
     if pretrained_embedding is None:
         raise ValueError(f"Pretrained model has no input embeddings: {repo_id}")
-    src_weight = pretrained_embedding.weight.detach().to(device="cpu", dtype=torch.float)
+    src_weight = pretrained_embedding.weight.detach().to(device="cpu", dtype=torch.bfloat16)
     tgt_weight = embedding.weight
     src_vocab, src_dim = tuple(src_weight.shape)
     tgt_vocab, tgt_dim = tuple(tgt_weight.shape)
@@ -515,6 +528,7 @@ def main() -> None:
     metadata = _build_safetensors_metadata(
         flat_config=flat_config,
     )
+    model_state = _cast_inference_state_bf16(model_state)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_file(model_state, str(output_path), metadata=metadata)

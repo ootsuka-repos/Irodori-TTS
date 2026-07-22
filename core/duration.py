@@ -164,7 +164,7 @@ def build_duration_features(
             ]
         )
 
-    return torch.tensor(rows, dtype=torch.float)
+    return torch.tensor(rows, dtype=torch.bfloat16)
 
 
 def set_duration_has_speaker_feature(

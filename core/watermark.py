@@ -11,7 +11,7 @@ IRODORI_WATERMARK_PAYLOAD = (73, 82, 68, 84, 83)  # "IRDTS"
 
 
 def _as_single_channel_vector(audio: torch.Tensor) -> torch.Tensor | None:
-    squeezed = audio.detach().float().squeeze()
+    squeezed = audio.detach().to(dtype=torch.bfloat16).squeeze()
     if squeezed.ndim == 0 or squeezed.numel() == 0:
         return None
     if squeezed.ndim == 1:
@@ -26,28 +26,31 @@ def _match_original_rank(audio: torch.Tensor, *, reference: torch.Tensor) -> tor
 
 
 class SilentCipherWatermarker:
-    def __init__(self, *, device: str, model_type: str = "44.1k") -> None:
-        self.model = self._load_backend(device=device, model_type=model_type)
+    def __init__(
+        self,
+        *,
+        device: str,
+        model_type: str = "44.1k",
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        if dtype is not torch.bfloat16:
+            raise ValueError(f"watermark inference requires bf16, got {dtype}")
+        self.dtype = dtype
+        self.model = self._load_backend(device=device, model_type=model_type, dtype=dtype)
 
     @staticmethod
-    def _load_backend(*, device: str, model_type: str):
-        try:
-            import silentcipher
-        except ImportError:
-            logger.warning(
-                "SilentCipher package is unavailable; generated audio will not be watermarked."
-            )
-            return None
-
-        try:
-            return silentcipher.get_model(model_type=model_type, device=device)
-        except Exception as exc:
-            logger.warning(
-                "SilentCipher model could not be loaded (%s); generated audio will not be "
-                "watermarked.",
-                exc,
-            )
-            return None
+    def _load_backend(*, device: str, model_type: str, dtype: torch.dtype):
+        del device, model_type
+        if dtype is not torch.bfloat16:
+            raise ValueError(f"watermark inference requires bf16, got {dtype}")
+        # SilentCipher currently hardcodes FP32 tensors and complex STFT/ISTFT.
+        # Running it would silently violate strict BF16 inference, so keep it
+        # disabled until the upstream backend offers a real BF16 path.
+        logger.warning(
+            "SilentCipher is disabled because its backend is not true-BF16 compatible; "
+            "generated audio will not be watermarked."
+        )
+        return None
 
     @property
     def ready(self) -> bool:
@@ -68,12 +71,12 @@ class SilentCipherWatermarker:
             return audio
 
         encoded, _ = self.model.encode_wav(
-            vector.to(self.model.device),
+            vector.to(self.model.device, dtype=self.dtype),
             int(sample_rate),
             list(payload),
             calc_sdr=False,
         )
-        encoded_audio = torch.as_tensor(encoded, dtype=torch.float, device="cpu")
+        encoded_audio = torch.as_tensor(encoded, dtype=self.dtype, device="cpu")
         return _match_original_rank(encoded_audio, reference=audio)
 
     def encode_batch(self, audios: list[torch.Tensor], *, sample_rate: int) -> list[torch.Tensor]:
