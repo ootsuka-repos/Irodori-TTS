@@ -165,6 +165,42 @@ def save_checkpoint(
     _atomic_torch_save(payload, path)
 
 
+def save_sampling_checkpoint(
+    path: Path,
+    model: torch.nn.Module,
+    step: int,
+    model_cfg: ModelConfig,
+    train_cfg: TrainConfig,
+    *,
+    epoch: int = 0,
+    ema: ModelEMA | None = None,
+) -> None:
+    """Weights-only checkpoint for the per-epoch sampling subprocess.
+
+    The sampler reads model / ema_model / model_config / train_config and never
+    touches optimizer or scheduler state, so a full save_checkpoint() writes
+    several GB of Muon+AdamW moments that are deleted seconds later. With EMA
+    enabled the sampler loads 'ema_model'; the very same tensors are aliased
+    under 'model' so torch.save stores that storage once (it dedupes by storage
+    identity) and the temp file holds a single copy of the weights.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if ema is not None:
+        weights = ema.state_dict()
+        payload: dict = {"model": weights, "ema_model": weights}
+    else:
+        payload = {"model": model.state_dict()}
+    payload.update(
+        {
+            "step": step,
+            "epoch": int(epoch),
+            "model_config": asdict(model_cfg),
+            "train_config": asdict(train_cfg),
+        }
+    )
+    _atomic_torch_save(payload, path)
+
+
 def _safe_unlink(path: Path) -> None:
     try:
         if path.is_dir():
@@ -2926,6 +2962,11 @@ def main() -> None:
         else:
             for group in optimizer.param_groups:
                 group["lr"] = new_base
+        # Re-seed from the resumed step. set_seed() at startup is step-independent,
+        # so every resume replayed the exact same noise / timestep / condition-drop
+        # draws as the previous resume did. This workflow restarts constantly, which
+        # made those first steps after each restart redundant.
+        set_seed((train_cfg.seed + rank + 0x9E3779B9 * step) % (2**63))
         if is_main_process:
             print(
                 f"Resumed from step={step} (epoch={start_epoch}) "
@@ -3562,18 +3603,34 @@ def main() -> None:
                     temp_sample_checkpoint = (
                         output_dir / f"checkpoint_sample_tmp_{step:07d}.pt"
                     )
-                    save_checkpoint(
-                        temp_sample_checkpoint,
-                        raw_model,
-                        optimizer,
-                        scheduler,
-                        step,
-                        model_cfg,
-                        train_cfg,
-                        base_init=base_init,
-                        epoch=epoch,
-                        ema=ema,
-                    )
+                    if (
+                        train_cfg.speaker_inversion_enabled
+                        or train_config_uses_lora(train_cfg)
+                    ):
+                        # These formats have their own on-disk layout; keep the
+                        # full writer so the sampler sees what it expects.
+                        save_checkpoint(
+                            temp_sample_checkpoint,
+                            raw_model,
+                            optimizer,
+                            scheduler,
+                            step,
+                            model_cfg,
+                            train_cfg,
+                            base_init=base_init,
+                            epoch=epoch,
+                            ema=ema,
+                        )
+                    else:
+                        save_sampling_checkpoint(
+                            temp_sample_checkpoint,
+                            raw_model,
+                            step,
+                            model_cfg,
+                            train_cfg,
+                            epoch=epoch,
+                            ema=ema,
+                        )
                     sample_checkpoint_path = temp_sample_checkpoint
                 progress.write(
                     f"generating comparison samples for epoch={epoch} step={step}..."
